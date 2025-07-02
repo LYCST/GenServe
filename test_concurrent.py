@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-GenServe 并发测试脚本
-同时发送多个请求测试多GPU并发处理能力
+GenServe 增强版并发测试脚本
+测试多GPU并发处理能力和队列管理
 """
 
 import asyncio
@@ -12,13 +12,33 @@ from datetime import datetime
 import base64
 import os
 from typing import List, Dict, Any
+import matplotlib.pyplot as plt
+import numpy as np
+from dataclasses import dataclass
+import uuid
 
-class ConcurrentTester:
-    """并发测试器"""
+@dataclass
+class TestResult:
+    """测试结果数据类"""
+    request_id: str
+    prompt: str
+    start_time: float
+    end_time: float
+    success: bool
+    device: str = ""
+    worker: str = ""
+    task_id: str = ""
+    generation_time: float = 0.0
+    queue_wait_time: float = 0.0
+    error: str = ""
+
+class EnhancedConcurrentTester:
+    """增强版并发测试器"""
     
     def __init__(self, base_url: str = "http://localhost:12411"):
         self.base_url = base_url
         self.session = None
+        self.test_results: List[TestResult] = []
     
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -30,241 +50,379 @@ class ConcurrentTester:
         if self.session:
             await self.session.close()
     
-    async def check_health(self) -> bool:
-        """检查服务健康状态"""
+    async def get_service_status(self) -> Dict[str, Any]:
+        """获取详细服务状态"""
         try:
-            async with self.session.get(f"{self.base_url}/health") as response:
+            async with self.session.get(f"{self.base_url}/status") as response:
                 if response.status == 200:
-                    result = await response.json()
-                    print("🟢 服务健康状态:")
-                    print(f"  状态: {result.get('status')}")
-                    print(f"  GPU可用: {result.get('gpu_available')}")
-                    
-                    concurrent_status = result.get('concurrent_status', {})
-                    print(f"  工作线程: {concurrent_status.get('worker_threads')}")
-                    print(f"  队列大小: {concurrent_status.get('queue_size')}")
-                    
-                    # 显示模型实例信息
-                    model_instances = concurrent_status.get('model_instances', {})
-                    for model_id, instances in model_instances.items():
-                        print(f"  模型 {model_id}:")
-                        for instance in instances:
-                            status_icon = "🟢" if not instance['is_busy'] else "🔴"
-                            print(f"    {status_icon} {instance['device']}: 忙碌={instance['is_busy']}, 总生成数={instance['total_generations']}")
-                    
-                    return True
+                    return await response.json()
                 else:
-                    print(f"❌ 健康检查失败: {response.status}")
-                    return False
+                    return {"error": f"HTTP {response.status}"}
         except Exception as e:
-            print(f"❌ 健康检查错误: {e}")
-            return False
+            return {"error": str(e)}
     
-    async def generate_single_image(self, prompt: str, request_id: int) -> Dict[str, Any]:
-        """生成单张图片"""
+    async def display_service_info(self):
+        """显示服务信息"""
+        print("🔍 获取服务状态...")
+        status = await self.get_service_status()
+        
+        if "error" in status:
+            print(f"❌ 无法获取服务状态: {status['error']}")
+            return False
+        
+        print("=" * 60)
+        print("🚀 GenServe 服务状态")
+        print("=" * 60)
+        
+        # 并发管理器状态
+        concurrent_status = status.get("concurrent_manager", {})
+        print(f"📊 并发管理器:")
+        print(f"  运行状态: {'🟢 运行中' if concurrent_status.get('is_running') else '🔴 已停止'}")
+        print(f"  全局队列: {concurrent_status.get('global_queue_size', 0)} 个任务")
+        print(f"  总队列大小: {concurrent_status.get('total_queue_size', 0)} 个任务")
+        print(f"  工作线程: {concurrent_status.get('worker_threads', 0)} 个")
+        print(f"  忙碌实例: {concurrent_status.get('busy_instances', 0)}/{concurrent_status.get('total_instances', 0)}")
+        
+        # 统计信息
+        stats = concurrent_status.get('stats', {})
+        print(f"  总任务: {stats.get('total_tasks', 0)}")
+        print(f"  已完成: {stats.get('completed_tasks', 0)}")
+        print(f"  失败: {stats.get('failed_tasks', 0)}")
+        print(f"  队列满拒绝: {stats.get('queue_full_rejections', 0)}")
+        
+        # 模型实例详情
+        model_instances = concurrent_status.get('model_instances', {})
+        for model_id, instances in model_instances.items():
+            print(f"\n🤖 模型 {model_id}:")
+            for instance in instances:
+                status_icon = "🔴" if instance['is_busy'] else "🟢"
+                current_task = f" (任务: {instance.get('current_task', 'None')})" if instance['is_busy'] else ""
+                print(f"  {status_icon} {instance['device']}: 队列={instance['queue_size']}/{instance['max_queue_size']}, 总生成={instance['total_generations']}{current_task}")
+        
+        # GPU负载信息
+        gpu_load = status.get("gpu_load", {})
+        if gpu_load:
+            print(f"\n💾 GPU内存使用:")
+            for gpu_id, load_info in gpu_load.items():
+                if load_info.get('available'):
+                    utilization = load_info.get('utilization_percent', 0)
+                    free_mb = load_info.get('free_mb', 0)
+                    total_mb = load_info.get('total_mb', 0)
+                    print(f"  {gpu_id}: {utilization:.1f}% 使用中, {free_mb:.0f}MB/{total_mb:.0f}MB 可用")
+        
+        print("=" * 60)
+        return True
+    
+    async def generate_single_image(self, prompt: str, request_id: str, priority: int = 0) -> TestResult:
+        """生成单张图片并记录详细信息"""
         payload = {
             "prompt": prompt,
             "model": "flux1-dev",
             "num_inference_steps": 20,
             "height": 1024,
             "width": 1024,
-            "seed": 42 + request_id  # 不同的种子
+            "seed": abs(hash(request_id)) % 10000  # 基于request_id生成稳定的种子
         }
         
-        start_time = time.time()
+        result = TestResult(
+            request_id=request_id,
+            prompt=prompt,
+            start_time=time.time(),
+            end_time=0,
+            success=False
+        )
         
         try:
             async with self.session.post(
                 f"{self.base_url}/generate", 
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=300)  # 5分钟超时
+                timeout=aiohttp.ClientTimeout(total=300)
             ) as response:
                 
-                elapsed_time = time.time() - start_time
+                result.end_time = time.time()
                 
                 if response.status == 200:
-                    result = await response.json()
+                    data = await response.json()
                     
-                    # 保存图片
-                    image_path = None
-                    if result.get("output"):
+                    result.success = True
+                    result.device = data.get("device", "unknown")
+                    result.worker = data.get("worker", "unknown")
+                    result.task_id = data.get("task_id", "")
+                    
+                    # 解析生成时间
+                    elapsed_str = data.get("elapsed_time", "0s")
+                    if elapsed_str.endswith('s'):
+                        try:
+                            result.generation_time = float(elapsed_str[:-1])
+                        except:
+                            result.generation_time = 0.0
+                    
+                    # 计算队列等待时间
+                    total_time = result.end_time - result.start_time
+                    result.queue_wait_time = max(0, total_time - result.generation_time)
+                    
+                    # 保存图片（可选）
+                    if data.get("output") and os.getenv("SAVE_TEST_IMAGES", "false").lower() == "true":
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        image_path = f"concurrent_test_{request_id}_{timestamp}.png"
+                        image_path = f"test_{request_id}_{timestamp}.png"
                         
-                        image_data = base64.b64decode(result["output"])
+                        image_data = base64.b64decode(data["output"])
                         with open(image_path, "wb") as f:
                             f.write(image_data)
-                    
-                    return {
-                        "success": True,
-                        "request_id": request_id,
-                        "prompt": prompt,
-                        "device": result.get("device"),
-                        "worker": result.get("worker"),
-                        "task_id": result.get("task_id"),
-                        "generation_time": result.get("elapsed_time", "unknown"),
-                        "total_time": elapsed_time,
-                        "image_path": image_path
-                    }
+                
                 else:
                     error_text = await response.text()
-                    return {
-                        "success": False,
-                        "request_id": request_id,
-                        "error": f"HTTP {response.status}: {error_text}",
-                        "total_time": elapsed_time
-                    }
+                    result.error = f"HTTP {response.status}: {error_text}"
                     
         except asyncio.TimeoutError:
-            return {
-                "success": False,
-                "request_id": request_id,
-                "error": "请求超时",
-                "total_time": time.time() - start_time
-            }
+            result.end_time = time.time()
+            result.error = "请求超时"
         except Exception as e:
-            return {
-                "success": False,
-                "request_id": request_id,
-                "error": str(e),
-                "total_time": time.time() - start_time
-            }
+            result.end_time = time.time()
+            result.error = str(e)
+        
+        return result
     
-    async def concurrent_test(self, prompts: List[str], concurrent_count: int = 4):
-        """并发测试"""
-        print(f"\n🚀 开始并发测试，同时发送 {concurrent_count} 个请求")
-        print(f"测试提示词: {prompts}")
+    async def burst_test(self, prompts: List[str], burst_size: int, burst_interval: float = 0) -> List[TestResult]:
+        """突发测试 - 快速发送多个请求"""
+        print(f"\n💥 突发测试: 发送 {burst_size} 个请求")
         
-        # 创建并发任务
         tasks = []
-        for i in range(concurrent_count):
-            prompt = prompts[i % len(prompts)]  # 循环使用提示词
-            task = self.generate_single_image(prompt, i + 1)
+        for i in range(burst_size):
+            prompt = prompts[i % len(prompts)]
+            request_id = f"burst_{i+1}_{uuid.uuid4().hex[:8]}"
+            task = self.generate_single_image(prompt, request_id)
             tasks.append(task)
+            
+            # 突发间隔
+            if burst_interval > 0 and i < burst_size - 1:
+                await asyncio.sleep(burst_interval)
         
-        # 记录开始时间
-        start_time = time.time()
-        
-        # 并发执行所有任务
-        print(f"⏱️  开始时间: {datetime.now().strftime('%H:%M:%S')}")
+        # 等待所有任务完成
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # 记录结束时间
-        total_elapsed = time.time() - start_time
-        print(f"⏱️  结束时间: {datetime.now().strftime('%H:%M:%S')}")
-        print(f"⏱️  总耗时: {total_elapsed:.2f}秒")
+        # 过滤异常
+        valid_results = [r for r in results if isinstance(r, TestResult)]
+        self.test_results.extend(valid_results)
         
-        # 分析结果
-        self.analyze_results(results, total_elapsed)
+        return valid_results
+    
+    async def sustained_load_test(self, prompts: List[str], duration: int, rate: float) -> List[TestResult]:
+        """持续负载测试"""
+        print(f"\n⏱️ 持续负载测试: {duration}秒, 每秒{rate}个请求")
         
+        end_time = time.time() + duration
+        results = []
+        request_count = 0
+        
+        while time.time() < end_time:
+            # 计算下一批请求数量
+            interval = 1.0 / rate
+            batch_size = max(1, int(rate))
+            
+            # 发送一批请求
+            tasks = []
+            for i in range(batch_size):
+                if time.time() >= end_time:
+                    break
+                
+                prompt = prompts[request_count % len(prompts)]
+                request_id = f"sustained_{request_count+1}_{uuid.uuid4().hex[:8]}"
+                task = self.generate_single_image(prompt, request_id)
+                tasks.append(task)
+                request_count += 1
+            
+            # 等待一段时间
+            if tasks:
+                # 不等待任务完成，继续发送
+                asyncio.create_task(self._collect_results(tasks, results))
+            
+            await asyncio.sleep(interval)
+        
+        # 等待剩余任务完成
+        print(f"⏳ 等待剩余任务完成...")
+        await asyncio.sleep(30)  # 等待30秒让任务完成
+        
+        self.test_results.extend(results)
         return results
     
-    def analyze_results(self, results: List[Dict[str, Any]], total_elapsed: float):
+    async def _collect_results(self, tasks: List, results: List[TestResult]):
+        """收集任务结果"""
+        try:
+            task_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in task_results:
+                if isinstance(result, TestResult):
+                    results.append(result)
+        except Exception as e:
+            print(f"收集结果时出错: {e}")
+    
+    def analyze_results(self, results: List[TestResult], test_name: str = "测试"):
         """分析测试结果"""
-        print(f"\n📊 测试结果分析:")
+        if not results:
+            print(f"❌ {test_name}: 没有结果数据")
+            return
+        
+        print(f"\n📊 {test_name} 结果分析:")
         print("=" * 60)
         
-        successful_results = [r for r in results if isinstance(r, dict) and r.get("success")]
-        failed_results = [r for r in results if isinstance(r, dict) and not r.get("success")]
-        exception_results = [r for r in results if not isinstance(r, dict)]
+        successful = [r for r in results if r.success]
+        failed = [r for r in results if not r.success]
         
-        print(f"✅ 成功: {len(successful_results)}")
-        print(f"❌ 失败: {len(failed_results)}")
-        print(f"💥 异常: {len(exception_results)}")
+        print(f"✅ 成功: {len(successful)}/{len(results)} ({len(successful)/len(results)*100:.1f}%)")
+        print(f"❌ 失败: {len(failed)}")
         
-        if successful_results:
-            print(f"\n🎯 成功请求详情:")
-            devices_used = {}
-            workers_used = {}
-            generation_times = []
+        if successful:
+            # 时间统计
+            total_times = [r.end_time - r.start_time for r in successful]
+            generation_times = [r.generation_time for r in successful if r.generation_time > 0]
+            queue_wait_times = [r.queue_wait_time for r in successful if r.queue_wait_time > 0]
             
-            for result in successful_results:
-                req_id = result["request_id"]
-                device = result.get("device", "unknown")
-                worker = result.get("worker", "unknown")
-                gen_time = result.get("generation_time", "unknown")
-                total_time = result.get("total_time", 0)
-                
-                print(f"  请求 {req_id}: 设备={device}, 工作线程={worker}, 生成耗时={gen_time}, 总耗时={total_time:.2f}s")
-                
-                # 统计设备使用情况
-                devices_used[device] = devices_used.get(device, 0) + 1
-                workers_used[worker] = workers_used.get(worker, 0) + 1
-                
-                if isinstance(gen_time, str) and gen_time.endswith('s'):
-                    try:
-                        generation_times.append(float(gen_time[:-1]))
-                    except:
-                        pass
-            
-            print(f"\n📈 设备使用统计:")
-            for device, count in devices_used.items():
-                print(f"  {device}: {count} 次")
-            
-            print(f"\n👷 工作线程统计:")
-            for worker, count in workers_used.items():
-                print(f"  {worker}: {count} 次")
-            
+            print(f"\n⏱️ 时间统计:")
+            print(f"  总时间: 平均 {np.mean(total_times):.2f}s, 中位数 {np.median(total_times):.2f}s")
             if generation_times:
-                avg_gen_time = sum(generation_times) / len(generation_times)
-                print(f"\n⏱️  平均生成时间: {avg_gen_time:.2f}秒")
-                print(f"⏱️  并发效率: {(avg_gen_time * len(successful_results)) / total_elapsed:.2f}x")
+                print(f"  生成时间: 平均 {np.mean(generation_times):.2f}s, 中位数 {np.median(generation_times):.2f}s")
+            if queue_wait_times:
+                print(f"  队列等待: 平均 {np.mean(queue_wait_times):.2f}s, 中位数 {np.median(queue_wait_times):.2f}s")
+            
+            # 设备分布
+            device_counts = {}
+            worker_counts = {}
+            for r in successful:
+                device_counts[r.device] = device_counts.get(r.device, 0) + 1
+                worker_counts[r.worker] = worker_counts.get(r.worker, 0) + 1
+            
+            print(f"\n🎯 设备分布:")
+            for device, count in sorted(device_counts.items()):
+                print(f"  {device}: {count} 次 ({count/len(successful)*100:.1f}%)")
+            
+            print(f"\n👷 工作线程分布:")
+            for worker, count in sorted(worker_counts.items()):
+                print(f"  {worker}: {count} 次 ({count/len(successful)*100:.1f}%)")
         
-        if failed_results:
-            print(f"\n❌ 失败请求详情:")
-            for result in failed_results:
-                req_id = result["request_id"]
-                error = result.get("error", "未知错误")
-                print(f"  请求 {req_id}: {error}")
+        if failed:
+            print(f"\n❌ 失败原因:")
+            error_counts = {}
+            for r in failed:
+                error_type = r.error.split(':')[0] if ':' in r.error else r.error
+                error_counts[error_type] = error_counts.get(error_type, 0) + 1
+            
+            for error, count in sorted(error_counts.items()):
+                print(f"  {error}: {count} 次")
+    
+    def create_performance_chart(self, results: List[TestResult], save_path: str = "performance_chart.png"):
+        """创建性能图表"""
+        if not results:
+            return
         
-        if exception_results:
-            print(f"\n💥 异常详情:")
-            for i, exc in enumerate(exception_results):
-                print(f"  异常 {i+1}: {exc}")
+        successful = [r for r in results if r.success]
+        if not successful:
+            return
+        
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle('GenServe 并发性能分析', fontsize=16)
+        
+        # 1. 时间线图
+        start_times = [(r.start_time - successful[0].start_time) for r in successful]
+        total_times = [r.end_time - r.start_time for r in successful]
+        
+        ax1.scatter(start_times, total_times, alpha=0.6)
+        ax1.set_xlabel('请求开始时间 (秒)')
+        ax1.set_ylabel('总处理时间 (秒)')
+        ax1.set_title('请求处理时间分布')
+        ax1.grid(True)
+        
+        # 2. 设备负载分布
+        devices = [r.device for r in successful]
+        device_counts = {d: devices.count(d) for d in set(devices)}
+        
+        ax2.bar(device_counts.keys(), device_counts.values())
+        ax2.set_xlabel('设备')
+        ax2.set_ylabel('任务数量')
+        ax2.set_title('设备负载分布')
+        ax2.tick_params(axis='x', rotation=45)
+        
+        # 3. 响应时间直方图
+        ax3.hist(total_times, bins=20, alpha=0.7, edgecolor='black')
+        ax3.set_xlabel('总处理时间 (秒)')
+        ax3.set_ylabel('频次')
+        ax3.set_title('响应时间分布')
+        ax3.grid(True)
+        
+        # 4. 队列等待时间
+        queue_times = [r.queue_wait_time for r in successful if r.queue_wait_time > 0]
+        if queue_times:
+            ax4.hist(queue_times, bins=20, alpha=0.7, edgecolor='black', color='orange')
+            ax4.set_xlabel('队列等待时间 (秒)')
+            ax4.set_ylabel('频次')
+            ax4.set_title('队列等待时间分布')
+            ax4.grid(True)
+        else:
+            ax4.text(0.5, 0.5, '无队列等待数据', ha='center', va='center', transform=ax4.transAxes)
+            ax4.set_title('队列等待时间分布')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"📈 性能图表已保存: {save_path}")
 
 async def main():
     """主函数"""
     print("=" * 60)
-    print("GenServe 并发测试")
+    print("🚀 GenServe 增强版并发测试")
     print("=" * 60)
     
     # 测试提示词
     test_prompts = [
-        "a beautiful landscape with mountains and lakes",
-        "a cute cat sitting on a chair",
-        "a futuristic city with flying cars",
-        "a peaceful forest with sunlight filtering through trees",
-        "an underwater scene with colorful fish",
-        "a majestic eagle soaring in the sky"
+        "a serene mountain landscape with a crystal clear lake reflecting the sky",
+        "a playful golden retriever running through a field of sunflowers",
+        "a futuristic cityscape with glowing skyscrapers and flying vehicles",
+        "an enchanted forest with ancient trees and magical glowing mushrooms",
+        "a peaceful beach at sunset with waves gently lapping the shore",
+        "a majestic eagle soaring above snow-capped mountain peaks",
+        "a cozy cabin in the woods with smoke rising from the chimney",
+        "a vibrant coral reef teeming with colorful tropical fish",
+        "a starry night sky over a vast desert with sand dunes",
+        "a bustling market square in a medieval town with cobblestone streets"
     ]
     
-    async with ConcurrentTester() as tester:
-        # 1. 检查服务状态
-        print("\n1. 检查服务状态...")
-        if not await tester.check_health():
-            print("服务未正常运行，请先启动服务")
+    async with EnhancedConcurrentTester() as tester:
+        # 1. 显示服务信息
+        print("\n1. 📋 检查服务状态...")
+        if not await tester.display_service_info():
+            print("❌ 服务未正常运行，请先启动服务")
             return
         
-        # 2. 并发测试
-        print("\n2. 执行并发测试...")
+        # 2. 突发测试
+        print("\n2. 💥 突发测试...")
+        burst_results = await tester.burst_test(test_prompts, 6)  # 6个并发请求
+        tester.analyze_results(burst_results, "突发测试")
         
-        # 测试不同的并发级别
-        concurrent_levels = [2, 3, 4]  # 减少并发级别，避免过载
+        # 等待服务稳定
+        await asyncio.sleep(5)
         
-        for level in concurrent_levels:
-            print(f"\n{'='*40}")
-            print(f"测试并发级别: {level}")
-            print(f"{'='*40}")
-            
-            results = await tester.concurrent_test(test_prompts, level)
-            
-            # 等待一段时间再进行下一轮测试
-            if level != concurrent_levels[-1]:
-                print(f"\n⏳ 等待 10 秒后进行下一轮测试...")
-                await asyncio.sleep(10)
+        # 3. 持续负载测试
+        print("\n3. ⏱️ 持续负载测试...")
+        load_results = await tester.sustained_load_test(test_prompts, 60, 0.5)  # 60秒，每秒0.5个请求
+        tester.analyze_results(load_results, "持续负载测试")
+        
+        # 4. 生成性能报告
+        print("\n4. 📊 生成性能报告...")
+        all_results = tester.test_results
+        tester.analyze_results(all_results, "综合测试")
+        
+        # 创建图表（如果安装了matplotlib）
+        try:
+            tester.create_performance_chart(all_results)
+        except ImportError:
+            print("📈 要生成性能图表，请安装matplotlib: pip install matplotlib")
+        except Exception as e:
+            print(f"📈 生成图表时出错: {e}")
+        
+        # 5. 最终状态检查
+        print("\n5. 🔍 最终状态检查...")
+        await tester.display_service_info()
     
-    print(f"\n✨ 所有测试完成！")
-    print(f"生成的图片保存在当前目录中，文件名格式: concurrent_test_<request_id>_<timestamp>.png")
+    print(f"\n✨ 测试完成！")
+    print(f"📁 如果启用了图片保存（SAVE_TEST_IMAGES=true），图片将保存在当前目录")
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())

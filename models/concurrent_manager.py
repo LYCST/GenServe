@@ -4,12 +4,13 @@ import time
 from typing import Dict, List, Optional, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import logging
-from queue import Queue, Empty
-from dataclasses import dataclass
+from queue import Queue, Empty, PriorityQueue
+from dataclasses import dataclass, field
 from .base import BaseModel
 from .flux_model import FluxModel
 from device_manager import DeviceManager
 from config import Config
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -22,42 +23,98 @@ class GenerationTask:
     params: Dict[str, Any]
     result_queue: Queue
     created_at: float
+    priority: int = 0  # 优先级，数字越小优先级越高
+    
+    def __lt__(self, other):
+        """支持优先级队列排序"""
+        if self.priority != other.priority:
+            return self.priority < other.priority
+        return self.created_at < other.created_at
 
 class ModelInstance:
     """模型实例，绑定到特定GPU"""
-    def __init__(self, model: BaseModel, device: str):
+    def __init__(self, model: BaseModel, device: str, instance_id: str):
         self.model = model
         self.device = device
+        self.instance_id = instance_id
         self.is_busy = False
         self.last_used = time.time()
         self.total_generations = 0
+        self.current_task = None
         self.lock = threading.Lock()
-        self.task_queue = Queue()  # 每个GPU的任务队列
+        self.task_queue = PriorityQueue()  # 使用优先级队列
+        
+        # 从配置获取队列大小限制
+        config = Config.get_config()
+        self.max_queue_size = config["concurrent"]["max_gpu_queue_size"]
     
     def is_available(self) -> bool:
         """检查实例是否可用"""
         with self.lock:
             return not self.is_busy and self.model.is_loaded
     
-    def set_busy(self, busy: bool):
+    def can_accept_task(self) -> bool:
+        """检查是否可以接受新任务（考虑队列大小）"""
+        return self.task_queue.qsize() < self.max_queue_size
+    
+    def set_busy(self, busy: bool, task_id: str = None):
         """设置忙碌状态"""
         with self.lock:
             self.is_busy = busy
+            self.current_task = task_id if busy else None
             if not busy:
                 self.last_used = time.time()
                 self.total_generations += 1
+    
+    def get_status(self) -> Dict[str, Any]:
+        """获取实例状态"""
+        with self.lock:
+            return {
+                "instance_id": self.instance_id,
+                "device": self.device,
+                "is_busy": self.is_busy,
+                "is_loaded": self.model.is_loaded,
+                "current_task": self.current_task,
+                "queue_size": self.task_queue.qsize(),
+                "max_queue_size": self.max_queue_size,
+                "total_generations": self.total_generations,
+                "last_used": self.last_used
+            }
 
 class ConcurrentModelManager:
-    """并发模型管理器 - 每个GPU一次只能执行一个任务"""
+    """改进的并发模型管理器"""
     
     def __init__(self):
         self.device_manager = DeviceManager()
         self.model_instances: Dict[str, List[ModelInstance]] = {}  # model_id -> [instances]
-        self.global_task_queue = Queue()  # 全局任务队列
+        self.instance_lookup: Dict[str, ModelInstance] = {}  # instance_id -> instance
+        
+        # 全局任务队列和调度
+        self.global_task_queue = PriorityQueue()
+        self.task_results: Dict[str, Queue] = {}  # task_id -> result_queue
+        
+        # 工作线程管理
         self.worker_threads = []
+        self.scheduler_thread = None
         self.is_running = False
+        
+        # 从配置获取参数
+        config = Config.get_config()
+        self.max_global_queue_size = config["concurrent"]["max_global_queue_size"]
+        self.task_timeout = config["concurrent"]["task_timeout"]
+        self.scheduler_sleep_time = config["concurrent"]["scheduler_sleep_time"]
+        self.load_balance_strategy = config["concurrent"]["load_balance_strategy"]
+        
+        # 统计信息
+        self.stats = {
+            "total_tasks": 0,
+            "completed_tasks": 0,
+            "failed_tasks": 0,
+            "queue_full_rejections": 0
+        }
+        
         self._initialize_models()
-        self._start_workers()
+        self._start_manager()
     
     def _initialize_models(self):
         """初始化模型实例"""
@@ -68,7 +125,7 @@ class ConcurrentModelManager:
                 self.model_instances[model_id] = []
             
             # 为每个GPU创建一个模型实例
-            for gpu_device in gpu_list:
+            for i, gpu_device in enumerate(gpu_list):
                 if self.device_manager.validate_device(gpu_device):
                     try:
                         # 创建模型实例
@@ -78,94 +135,134 @@ class ConcurrentModelManager:
                             logger.warning(f"未知模型类型: {model_id}")
                             continue
                         
+                        # 生成唯一实例ID
+                        instance_id = f"{model_id}_{gpu_device.replace(':', '_')}_{i}"
+                        
                         # 加载模型
                         if model.load():
-                            instance = ModelInstance(model, gpu_device)
+                            instance = ModelInstance(model, gpu_device, instance_id)
                             self.model_instances[model_id].append(instance)
-                            logger.info(f"模型实例 {model_id} 在 {gpu_device} 上创建成功")
+                            self.instance_lookup[instance_id] = instance
+                            logger.info(f"模型实例 {instance_id} 创建成功")
                         else:
                             logger.error(f"模型实例 {model_id} 在 {gpu_device} 上加载失败")
                     except Exception as e:
-                        logger.error(f"创建模型实例 {model_id} 在 {gpu_device} 失败: {e}")
+                        logger.error(f"创建模型实例失败: {e}")
     
-    def _start_workers(self):
-        """启动工作线程"""
+    def _start_manager(self):
+        """启动管理器"""
         self.is_running = True
         
-        # 为每个GPU启动一个专门的工作线程
+        # 启动全局调度器
+        self.scheduler_thread = threading.Thread(
+            target=self._global_scheduler_loop, 
+            name="global-scheduler"
+        )
+        self.scheduler_thread.daemon = True
+        self.scheduler_thread.start()
+        logger.info("全局调度器已启动")
+        
+        # 为每个GPU实例启动工作线程
         for model_id, instances in self.model_instances.items():
-            for i, instance in enumerate(instances):
+            for instance in instances:
                 worker = threading.Thread(
-                    target=self._gpu_worker_loop, 
-                    args=(f"gpu-worker-{instance.device}", instance)
+                    target=self._gpu_worker_loop,
+                    args=(instance,),
+                    name=f"worker-{instance.instance_id}"
                 )
                 worker.daemon = True
                 worker.start()
                 self.worker_threads.append(worker)
-                logger.info(f"GPU工作线程 {worker.name} 已启动，负责 {instance.device}")
-        
-        # 启动全局调度线程
-        scheduler = threading.Thread(target=self._scheduler_loop, args=("scheduler",))
-        scheduler.daemon = True
-        scheduler.start()
-        self.worker_threads.append(scheduler)
-        logger.info("全局调度线程已启动")
+                logger.info(f"GPU工作线程 {worker.name} 已启动")
     
-    def _scheduler_loop(self, scheduler_name: str):
-        """全局调度循环 - 将任务分配给可用的GPU"""
-        logger.info(f"全局调度器 {scheduler_name} 开始运行")
+    def _global_scheduler_loop(self):
+        """全局调度器循环 - 智能任务分配"""
+        logger.info("全局调度器开始运行")
         
         while self.is_running:
             try:
-                # 获取全局任务
-                task = self.global_task_queue.get(timeout=1.0)
+                # 获取全局任务（带超时）
+                task = self.global_task_queue.get(timeout=self.scheduler_sleep_time)
                 
-                # 找到可用的GPU实例
-                available_instance = self._find_available_instance(task.model_id)
+                # 找到最佳的GPU实例
+                best_instance = self._find_best_instance(task.model_id)
                 
-                if available_instance:
-                    # 将任务分配给GPU
-                    available_instance.task_queue.put(task)
-                    logger.info(f"任务 {task.task_id} 已分配给 {available_instance.device}")
+                if best_instance:
+                    # 分配任务给GPU
+                    best_instance.task_queue.put(task)
+                    logger.info(f"任务 {task.task_id} 已分配给 {best_instance.instance_id}")
                 else:
-                    # 没有可用GPU，重新放回全局队列
+                    # 所有GPU都忙碌或队列已满，重新放回队列
                     self.global_task_queue.put(task)
-                    time.sleep(0.1)  # 短暂等待
+                    # 更长的等待时间，避免CPU占用过高
+                    time.sleep(self.scheduler_sleep_time * 5)
                     
             except Empty:
-                # 队列为空，继续循环
                 continue
             except Exception as e:
-                logger.error(f"全局调度器处理任务时发生错误: {e}")
+                logger.error(f"全局调度器错误: {e}")
     
-    def _gpu_worker_loop(self, worker_name: str, instance: ModelInstance):
-        """GPU工作线程循环 - 每个GPU一个线程"""
-        logger.info(f"GPU工作线程 {worker_name} 开始运行，负责 {instance.device}")
+    def _find_best_instance(self, model_id: str) -> Optional[ModelInstance]:
+        """找到最佳的模型实例 - 改进的负载均衡算法"""
+        if model_id not in self.model_instances:
+            return None
+        
+        instances = self.model_instances[model_id]
+        
+        # 过滤可接受任务的实例
+        available_instances = [
+            inst for inst in instances 
+            if inst.model.is_loaded and inst.can_accept_task()
+        ]
+        
+        if not available_instances:
+            return None
+        
+        # 根据负载均衡策略选择实例
+        if self.load_balance_strategy == "queue_length":
+            # 优先选择队列最短的实例
+            return min(available_instances, key=lambda x: x.task_queue.qsize())
+        elif self.load_balance_strategy == "memory_usage":
+            # 优先选择内存使用最少的实例（需要实现内存监控）
+            return min(available_instances, key=lambda x: x.task_queue.qsize())  # 暂时使用队列长度
+        elif self.load_balance_strategy == "round_robin":
+            # 轮询策略
+            idle_instances = [inst for inst in available_instances if not inst.is_busy]
+            if idle_instances:
+                return idle_instances[0]  # 选择第一个空闲实例
+            return available_instances[0]  # 否则选择第一个可用实例
+        else:
+            # 默认策略：优先选择空闲的实例
+            idle_instances = [inst for inst in available_instances if not inst.is_busy]
+            if idle_instances:
+                return min(idle_instances, key=lambda x: x.task_queue.qsize())
+            return min(available_instances, key=lambda x: x.task_queue.qsize())
+    
+    def _gpu_worker_loop(self, instance: ModelInstance):
+        """GPU工作线程循环"""
+        logger.info(f"GPU工作线程开始运行: {instance.instance_id}")
         
         while self.is_running:
             try:
-                # 获取分配给这个GPU的任务
+                # 获取任务
                 task = instance.task_queue.get(timeout=1.0)
                 
                 # 处理任务
-                self._process_task_on_gpu(task, instance, worker_name)
+                self._process_task_on_gpu(task, instance)
                 
             except Empty:
-                # 队列为空，继续循环
                 continue
             except Exception as e:
-                logger.error(f"GPU工作线程 {worker_name} 处理任务时发生错误: {e}")
+                logger.error(f"GPU工作线程 {instance.instance_id} 错误: {e}")
     
-    def _process_task_on_gpu(self, task: GenerationTask, instance: ModelInstance, worker_name: str):
+    def _process_task_on_gpu(self, task: GenerationTask, instance: ModelInstance):
         """在指定GPU上处理任务"""
-        logger.info(f"GPU工作线程 {worker_name} 开始处理任务 {task.task_id}")
+        logger.info(f"开始处理任务 {task.task_id} 在 {instance.device}")
         
         # 标记GPU为忙碌
-        instance.set_busy(True)
+        instance.set_busy(True, task.task_id)
         
         try:
-            logger.info(f"任务 {task.task_id} 在 {instance.device} 上执行")
-            
             # 设置CUDA设备
             if instance.device.startswith("cuda:"):
                 import torch
@@ -175,48 +272,64 @@ class ConcurrentModelManager:
             
             # 执行生成
             result = instance.model.generate(task.prompt, **task.params)
-            result["task_id"] = task.task_id
-            result["device"] = instance.device
-            result["worker"] = worker_name
+            result.update({
+                "task_id": task.task_id,
+                "device": instance.device,
+                "instance_id": instance.instance_id,
+                "queue_wait_time": time.time() - task.created_at
+            })
             
             # 返回结果
             task.result_queue.put(result)
+            
+            # 更新统计
+            self.stats["completed_tasks"] += 1
             
             logger.info(f"任务 {task.task_id} 完成，耗时: {result.get('elapsed_time', 0):.2f}秒")
             
         except Exception as e:
             logger.error(f"处理任务 {task.task_id} 时发生错误: {e}")
+            
             result = {
                 "success": False,
                 "error": str(e),
-                "task_id": task.task_id
+                "task_id": task.task_id,
+                "device": instance.device,
+                "instance_id": instance.instance_id
             }
             task.result_queue.put(result)
+            
+            # 更新统计
+            self.stats["failed_tasks"] += 1
+            
         finally:
             # 释放GPU
             instance.set_busy(False)
     
-    def _find_available_instance(self, model_id: str) -> Optional[ModelInstance]:
-        """找到可用的模型实例"""
-        if model_id not in self.model_instances:
-            return None
+    async def generate_image_async(self, model_id: str, prompt: str, priority: int = 0, **kwargs) -> Dict[str, Any]:
+        """异步生成图片 - 支持优先级"""
+        task_id = str(uuid.uuid4())
         
-        instances = self.model_instances[model_id]
-        available_instances = [inst for inst in instances if inst.is_available()]
+        # 检查是否有可用实例
+        if model_id not in self.model_instances or not self.model_instances[model_id]:
+            return {
+                "success": False,
+                "error": f"模型 {model_id} 不可用",
+                "task_id": task_id
+            }
         
-        if not available_instances:
-            return None
-        
-        # 选择最近最少使用的实例
-        best_instance = min(available_instances, key=lambda x: x.last_used)
-        return best_instance
-    
-    async def generate_image_async(self, model_id: str, prompt: str, **kwargs) -> Dict[str, Any]:
-        """异步生成图片"""
-        task_id = f"{model_id}_{int(time.time() * 1000)}_{id(prompt)}"
+        # 检查全局队列是否过载
+        if self.global_task_queue.qsize() > self.max_global_queue_size:
+            self.stats["queue_full_rejections"] += 1
+            return {
+                "success": False,
+                "error": "服务器过载，请稍后重试",
+                "task_id": task_id
+            }
         
         # 创建结果队列
         result_queue = Queue()
+        self.task_results[task_id] = result_queue
         
         # 创建任务
         task = GenerationTask(
@@ -225,20 +338,23 @@ class ConcurrentModelManager:
             prompt=prompt,
             params=kwargs,
             result_queue=result_queue,
-            created_at=time.time()
+            created_at=time.time(),
+            priority=priority
         )
         
         # 添加到全局任务队列
         self.global_task_queue.put(task)
-        logger.info(f"任务 {task_id} 已加入全局队列，当前队列大小: {self.global_task_queue.qsize()}")
+        self.stats["total_tasks"] += 1
         
-        # 等待结果
+        logger.info(f"任务 {task_id} 已加入队列，优先级: {priority}")
+        
         try:
-            # 设置超时时间为5分钟
+            # 等待结果（使用配置的超时时间）
             result = await asyncio.get_event_loop().run_in_executor(
-                None, result_queue.get, True, 300
+                None, result_queue.get, True, self.task_timeout
             )
             return result
+            
         except Exception as e:
             logger.error(f"等待任务 {task_id} 结果时发生错误: {e}")
             return {
@@ -246,41 +362,58 @@ class ConcurrentModelManager:
                 "error": f"任务超时或发生错误: {str(e)}",
                 "task_id": task_id
             }
+        finally:
+            # 清理结果队列
+            self.task_results.pop(task_id, None)
     
     def get_status(self) -> Dict[str, Any]:
-        """获取管理器状态"""
-        status = {
+        """获取详细状态"""
+        # 计算总体统计
+        total_queue_size = sum(
+            inst.task_queue.qsize() 
+            for instances in self.model_instances.values() 
+            for inst in instances
+        )
+        
+        busy_instances = sum(
+            1 for instances in self.model_instances.values() 
+            for inst in instances if inst.is_busy
+        )
+        
+        total_instances = sum(
+            len(instances) for instances in self.model_instances.values()
+        )
+        
+        return {
             "is_running": self.is_running,
             "global_queue_size": self.global_task_queue.qsize(),
+            "max_global_queue_size": self.max_global_queue_size,
+            "total_queue_size": total_queue_size,
             "worker_threads": len(self.worker_threads),
-            "model_instances": {}
+            "busy_instances": busy_instances,
+            "total_instances": total_instances,
+            "load_balance_strategy": self.load_balance_strategy,
+            "task_timeout": self.task_timeout,
+            "stats": self.stats.copy(),
+            "model_instances": {
+                model_id: [inst.get_status() for inst in instances]
+                for model_id, instances in self.model_instances.items()
+            }
         }
-        
-        for model_id, instances in self.model_instances.items():
-            status["model_instances"][model_id] = []
-            for i, instance in enumerate(instances):
-                status["model_instances"][model_id].append({
-                    "index": i,
-                    "device": instance.device,
-                    "is_busy": instance.is_busy,
-                    "is_loaded": instance.model.is_loaded,
-                    "total_generations": instance.total_generations,
-                    "last_used": instance.last_used,
-                    "queue_size": instance.task_queue.qsize()
-                })
-        
-        return status
     
     def get_model_list(self) -> List[Dict[str, Any]]:
         """获取模型列表"""
         models = []
         for model_id, instances in self.model_instances.items():
             if instances:
-                # 使用第一个实例的信息
                 first_instance = instances[0]
                 model_info = first_instance.model.get_info()
-                model_info["total_instances"] = len(instances)
-                model_info["available_instances"] = len([inst for inst in instances if inst.is_available()])
+                model_info.update({
+                    "total_instances": len(instances),
+                    "available_instances": len([inst for inst in instances if inst.is_available()]),
+                    "busy_instances": len([inst for inst in instances if inst.is_busy]),
+                    "total_queue_size": sum(inst.task_queue.qsize() for inst in instances)
+                })
                 models.append(model_info)
         return models
     
@@ -289,6 +422,10 @@ class ConcurrentModelManager:
         logger.info("正在关闭并发模型管理器...")
         
         self.is_running = False
+        
+        # 等待调度器线程结束
+        if self.scheduler_thread:
+            self.scheduler_thread.join(timeout=5.0)
         
         # 等待工作线程结束
         for worker in self.worker_threads:

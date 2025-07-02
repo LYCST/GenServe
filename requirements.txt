@@ -9,3 +9,7 @@ safetensors
 Pillow
 python-multipart
 pydantic
+matplotlib
+numpy
+psutil
+

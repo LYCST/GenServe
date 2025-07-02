@@ -83,7 +83,8 @@ class DeviceManager:
     def select_best_gpu_for_model(model_id: str) -> str:
         """为指定模型选择最佳的GPU设备"""
         # 获取模型可用的GPU列表
-        available_gpus = Config.get_model_gpu_config(model_id)
+        gpu_config = Config.get_model_gpu_config()
+        available_gpus = gpu_config.get(model_id, [])
         
         if not torch.cuda.is_available():
             logger.info(f"CUDA不可用，模型 {model_id} 将使用CPU")

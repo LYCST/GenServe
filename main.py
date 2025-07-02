@@ -165,7 +165,7 @@ async def generate_image(request: GenerateRequest):
         generation_params = {}
         
         # 只更新非None的参数
-        for key, value in request.dict().items():
+        for key, value in request.model_dump().items():
             if key not in ['prompt', 'model'] and value is not None:
                 generation_params[key] = value
         
