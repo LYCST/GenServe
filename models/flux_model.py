@@ -49,8 +49,8 @@ class FluxModel(BaseModel):
                     use_safetensors=True,
                     local_files_only=True
                 )
-                # 启用CPU卸载以节省GPU内存 - 不手动移动到GPU
-                self.pipe.enable_model_cpu_offload(gpu_id=int(best_gpu.split(":")[1]) if best_gpu.startswith("cuda") else 0)
+                # 启用CPU卸载以节省GPU内存 - 不指定gpu_id让其自动选择
+                self.pipe.enable_model_cpu_offload()
                 load_success = True
                 logger.info("FluxPipeline with CPU offload加载成功")
                 
@@ -67,8 +67,8 @@ class FluxModel(BaseModel):
                         use_safetensors=True,
                         local_files_only=True
                     )
-                    # 启用CPU卸载
-                    self.pipe.enable_model_cpu_offload(gpu_id=int(best_gpu.split(":")[1]) if best_gpu.startswith("cuda") else 0)
+                    # 启用CPU卸载 - 不指定gpu_id
+                    self.pipe.enable_model_cpu_offload()
                     load_success = True
                     logger.info("DiffusionPipeline with CPU offload加载成功")
                     
@@ -85,8 +85,8 @@ class FluxModel(BaseModel):
                             local_files_only=True,
                             trust_remote_code=True
                         )
-                        # 启用CPU卸载
-                        self.pipe.enable_model_cpu_offload(gpu_id=int(best_gpu.split(":")[1]) if best_gpu.startswith("cuda") else 0)
+                        # 启用CPU卸载 - 不指定gpu_id
+                        self.pipe.enable_model_cpu_offload()
                         load_success = True
                         logger.info("宽松参数with CPU offload加载成功")
                         
@@ -129,47 +129,27 @@ class FluxModel(BaseModel):
         
         # 使用模型加载时选择的GPU设备
         device = self.gpu_device
-        logger.info(f"使用设备进行生成: {device}")
+        logger.debug(f"🎯 使用设备进行生成: {device}")
         
         start_time = time.time()
         
         try:
-            # 设置随机种子
-            if device.startswith("cuda"):
-                gpu_id = int(device.split(":")[1])
-                torch.cuda.manual_seed(params['seed'])
-                # 设置当前设备
-                torch.cuda.set_device(gpu_id)
-                # 清理GPU内存
-                torch.cuda.empty_cache()
-            else:
-                torch.manual_seed(params['seed'])
+            # 设置随机种子 - 使用CPU generator如示例所示
+            generator = torch.Generator("cpu").manual_seed(params['seed'])
             
             logger.info(f"开始生成图片，提示词: {prompt}，设备: {device}")
             
             with torch.no_grad():
-                # 尝试使用Flux的标准参数
-                try:
-                    result = self.pipe(
-                        prompt=prompt,
-                        guidance_scale=params['cfg'],
-                        height=params['height'],
-                        width=params['width'],
-                        num_inference_steps=params['num_inference_steps']
-                    )
-                except Exception as e:
-                    logger.warning(f"使用Flux参数失败，尝试通用参数: {e}")
-                    # 清理GPU内存后重试
-                    if device.startswith("cuda"):
-                        torch.cuda.empty_cache()
-                    
-                    # 回退到更通用的参数
-                    result = self.pipe(
-                        prompt=prompt,
-                        num_inference_steps=params['num_inference_steps'],
-                        height=params['height'],
-                        width=params['width']
-                    )
+                # 使用与工作示例相同的参数
+                result = self.pipe(
+                    prompt=prompt,
+                    height=params['height'],
+                    width=params['width'],
+                    guidance_scale=params['cfg'],
+                    num_inference_steps=params['num_inference_steps'],
+                    max_sequence_length=512,  # 添加这个关键参数
+                    generator=generator
+                )
             
             image = result.images[0]
             
@@ -224,8 +204,8 @@ class FluxModel(BaseModel):
             "num_inference_steps": 50,  # Flux推荐使用50步
             "seed": 42,
             "cfg": 3.5,  # Flux推荐使用3.5
-            "height": 768,  # Flux推荐尺寸
-            "width": 1360,  # Flux推荐尺寸
+            "height": 1024,  # 改为1024x1024如示例
+            "width": 1024,   # 改为1024x1024如示例
             "save_disk_path": None
         }
     

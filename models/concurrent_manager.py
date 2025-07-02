@@ -11,6 +11,7 @@ from .flux_model import FluxModel
 from device_manager import DeviceManager
 from config import Config
 import uuid
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,7 @@ class ConcurrentModelManager:
     def _find_best_instance(self, model_id: str) -> Optional[ModelInstance]:
         """找到最佳的模型实例 - 改进的负载均衡算法"""
         if model_id not in self.model_instances:
+            logger.warning(f"⚠️ 模型 {model_id} 不存在")
             return None
         
         instances = self.model_instances[model_id]
@@ -216,27 +218,21 @@ class ConcurrentModelManager:
         ]
         
         if not available_instances:
+            logger.debug(f"⚠️ 模型 {model_id} 没有可用实例")
             return None
         
-        # 根据负载均衡策略选择实例
-        if self.load_balance_strategy == "queue_length":
-            # 优先选择队列最短的实例
-            return min(available_instances, key=lambda x: x.task_queue.qsize())
-        elif self.load_balance_strategy == "memory_usage":
-            # 优先选择内存使用最少的实例（需要实现内存监控）
-            return min(available_instances, key=lambda x: x.task_queue.qsize())  # 暂时使用队列长度
-        elif self.load_balance_strategy == "round_robin":
-            # 轮询策略
-            idle_instances = [inst for inst in available_instances if not inst.is_busy]
-            if idle_instances:
-                return idle_instances[0]  # 选择第一个空闲实例
-            return available_instances[0]  # 否则选择第一个可用实例
-        else:
-            # 默认策略：优先选择空闲的实例
-            idle_instances = [inst for inst in available_instances if not inst.is_busy]
-            if idle_instances:
-                return min(idle_instances, key=lambda x: x.task_queue.qsize())
-            return min(available_instances, key=lambda x: x.task_queue.qsize())
+        # 优先选择空闲的实例
+        idle_instances = [inst for inst in available_instances if not inst.is_busy]
+        if idle_instances:
+            # 在空闲实例中选择队列最短的
+            best = min(idle_instances, key=lambda x: x.task_queue.qsize())
+            logger.debug(f"✅ 选择空闲实例 {best.instance_id}，队列大小: {best.task_queue.qsize()}")
+            return best
+        
+        # 如果都在忙碌，选择队列最短的
+        best = min(available_instances, key=lambda x: x.task_queue.qsize())
+        logger.debug(f"✅ 选择忙碌实例 {best.instance_id}，队列大小: {best.task_queue.qsize()}")
+        return best
     
     def _gpu_worker_loop(self, instance: ModelInstance):
         """GPU工作线程循环"""
@@ -257,7 +253,7 @@ class ConcurrentModelManager:
     
     def _process_task_on_gpu(self, task: GenerationTask, instance: ModelInstance):
         """在指定GPU上处理任务"""
-        logger.info(f"开始处理任务 {task.task_id} 在 {instance.device}")
+        logger.info(f"🚀 开始处理任务 {task.task_id[:8]} 在 {instance.device}")
         
         # 标记GPU为忙碌
         instance.set_busy(True, task.task_id)
@@ -265,10 +261,14 @@ class ConcurrentModelManager:
         try:
             # 设置CUDA设备
             if instance.device.startswith("cuda:"):
-                import torch
                 gpu_id = int(instance.device.split(":")[1])
                 torch.cuda.set_device(gpu_id)
                 torch.cuda.empty_cache()
+                logger.debug(f"🎯 CUDA设备已设置为: cuda:{gpu_id}")
+            
+            # 确保模型在正确设备上
+            if hasattr(instance.model, 'gpu_device'):
+                instance.model.gpu_device = instance.device
             
             # 执行生成
             result = instance.model.generate(task.prompt, **task.params)
@@ -285,10 +285,12 @@ class ConcurrentModelManager:
             # 更新统计
             self.stats["completed_tasks"] += 1
             
-            logger.info(f"任务 {task.task_id} 完成，耗时: {result.get('elapsed_time', 0):.2f}秒")
+            logger.info(f"✅ 任务 {task.task_id[:8]} 完成，设备: {instance.device}，耗时: {result.get('elapsed_time', 0):.2f}秒")
             
         except Exception as e:
-            logger.error(f"处理任务 {task.task_id} 时发生错误: {e}")
+            logger.error(f"❌ 处理任务 {task.task_id[:8]} 时发生错误: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             
             result = {
                 "success": False,
@@ -305,6 +307,10 @@ class ConcurrentModelManager:
         finally:
             # 释放GPU
             instance.set_busy(False)
+            
+            # 清理GPU缓存
+            if instance.device.startswith("cuda:"):
+                torch.cuda.empty_cache()
     
     async def generate_image_async(self, model_id: str, prompt: str, priority: int = 0, **kwargs) -> Dict[str, Any]:
         """异步生成图片 - 支持优先级"""
