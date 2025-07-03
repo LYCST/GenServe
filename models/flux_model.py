@@ -43,6 +43,106 @@ class FluxModel(BaseModel):
         else:
             return "0"  # 默认使用GPU 0
     
+    def _deep_gpu_cleanup(self, target_device: Optional[str] = None):
+        """深度GPU显存清理 - 增强版本"""
+        try:
+            # 如果指定了目标设备，只清理该设备
+            if target_device and target_device.startswith("cuda:"):
+                gpu_id = int(target_device.split(":")[1])
+                with torch.cuda.device(gpu_id):
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+                    torch.cuda.synchronize()
+                logger.debug(f"已清理指定GPU {target_device} 显存")
+                return
+            
+            # 清理当前GPU
+            if self.gpu_device.startswith("cuda:"):
+                gpu_id = int(self.gpu_device.split(":")[1])
+                with torch.cuda.device(gpu_id):
+                    # 强制同步
+                    torch.cuda.synchronize()
+                    # 清理缓存
+                    torch.cuda.empty_cache()
+                    # 重置统计
+                    torch.cuda.reset_peak_memory_stats()
+                    # 再次同步
+                    torch.cuda.synchronize()
+                logger.debug(f"已清理GPU {self.gpu_device} 显存")
+            
+            # 强制垃圾回收
+            gc.collect()
+            
+            # 再次清理所有GPU缓存
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    with torch.cuda.device(i):
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+            
+        except Exception as e:
+            logger.warning(f"深度GPU清理时出错: {e}")
+    
+    def _safe_pipeline_cleanup(self):
+        """安全清理pipeline及其组件"""
+        try:
+            if hasattr(self, 'pipe') and self.pipe is not None:
+                logger.info(f"开始清理pipeline组件 (实例: {self._instance_id})")
+                
+                # 获取pipeline中的所有组件
+                components_to_cleanup = []
+                
+                # 检查并收集需要清理的组件
+                for attr_name in ['transformer', 'vae', 'text_encoder', 'text_encoder_2', 
+                                'scheduler', 'tokenizer', 'tokenizer_2']:
+                    if hasattr(self.pipe, attr_name):
+                        component = getattr(self.pipe, attr_name)
+                        if component is not None:
+                            components_to_cleanup.append((attr_name, component))
+                
+                # 逐个清理组件
+                for name, component in components_to_cleanup:
+                    try:
+                        # 如果组件有参数，尝试移动到CPU
+                        if hasattr(component, 'to') and hasattr(component, 'parameters'):
+                            component.to('cpu')
+                            logger.debug(f"已将 {name} 移动到CPU")
+                        
+                        # 如果组件有cuda()方法，说明可能在GPU上
+                        if hasattr(component, 'cuda'):
+                            try:
+                                component.cpu()
+                                logger.debug(f"已将 {name} 移动到CPU")
+                            except:
+                                pass
+                                
+                    except Exception as e:
+                        logger.warning(f"清理组件 {name} 时出错: {e}")
+                
+                # 清理pipeline本身
+                try:
+                    # 禁用CPU offload
+                    if hasattr(self.pipe, 'disable_model_cpu_offload'):
+                        self.pipe.disable_model_cpu_offload()
+                        logger.debug("已禁用模型CPU offload")
+                except Exception as e:
+                    logger.warning(f"禁用CPU offload时出错: {e}")
+                
+                # 尝试将整个pipeline移动到CPU
+                try:
+                    self.pipe.to('cpu')
+                    logger.debug("已将pipeline移动到CPU")
+                except Exception as e:
+                    logger.warning(f"移动pipeline到CPU时出错: {e}")
+                
+                # 删除pipeline引用
+                del self.pipe
+                self.pipe = None
+                logger.info(f"Pipeline已删除 (实例: {self._instance_id})")
+                
+        except Exception as e:
+            logger.error(f"清理pipeline时出错: {e}")
+    
     def load(self) -> bool:
         """加载Flux模型"""
         try:
@@ -51,9 +151,6 @@ class FluxModel(BaseModel):
                 logger.error(f"模型路径不存在: {self.model_path}")
                 return False
             
-            # 尝试多种加载方式
-            load_success = False
-
             # 只有在使用GPU时才设置环境变量
             if self.gpu_id != "cpu":
                 logger.info(f"正在加载模型: {self.model_name} 到设备: {self.gpu_device} (实例: {self._instance_id})")
@@ -79,21 +176,14 @@ class FluxModel(BaseModel):
                     self.pipe = self.pipe.to("cpu")
                     logger.info(f"FluxPipeline加载到CPU成功 (实例: {self._instance_id})")
                 
-                load_success = True
+                self.is_loaded = True
+                logger.info(f"模型 {self.model_name} 加载完成 (实例: {self._instance_id})")
+                return True
                 
             except Exception as e:
                 logger.error(f"模型加载失败: {e}")
                 return False
                 
-            if not load_success:
-                return False
-            
-            logger.info(f"模型 {self.model_name} 加载完成，设备: {self.gpu_device} (实例: {self._instance_id})")
-            
-            self.is_loaded = True
-            logger.info(f"模型 {self.model_name} 加载完成 (实例: {self._instance_id})")
-            return True
-            
         except Exception as e:
             logger.error(f"模型 {self.model_name} 加载失败: {e} (实例: {self._instance_id})")
             self.is_loaded = False
@@ -161,9 +251,8 @@ class FluxModel(BaseModel):
             
             elapsed_time = time.time() - start_time
             
-            # 清理GPU内存
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
+            # 成功后的轻量级清理
+            self._deep_gpu_cleanup()
             
             # 如果指定了保存路径，保存图片
             save_to_disk = False
@@ -190,20 +279,10 @@ class FluxModel(BaseModel):
             
         except Exception as e:
             logger.error(f"图片生成失败: {e} (实例: {self._instance_id})")
-            # 清理GPU内存 - 增强版本
-            if device.startswith("cuda"):
-                try:
-                    # 强制清理所有缓存
-                    torch.cuda.empty_cache()
-                    # 重置内存分配器
-                    torch.cuda.reset_peak_memory_stats()
-                    # 强制垃圾回收
-                    gc.collect()
-                    # 再次清理缓存
-                    torch.cuda.empty_cache()
-                    logger.debug(f"已彻底清理GPU显存 (实例: {self._instance_id})")
-                except Exception as cleanup_error:
-                    logger.warning(f"清理GPU显存时出错: {cleanup_error}")
+            
+            # 失败时的彻底清理
+            self._emergency_cleanup()
+            
             return {
                 "success": False,
                 "error": str(e),
@@ -211,6 +290,46 @@ class FluxModel(BaseModel):
                 "device": device,
                 "instance_id": self._instance_id
             }
+    
+    def _emergency_cleanup(self):
+        """紧急清理 - 在生成失败时使用"""
+        logger.warning(f"执行紧急清理 (实例: {self._instance_id})")
+        
+        try:
+            # 1. 先尝试深度GPU清理
+            self._deep_gpu_cleanup()
+            
+            # 2. 清理pipeline组件
+            self._safe_pipeline_cleanup()
+            
+            # 3. 强制垃圾回收
+            gc.collect()
+            
+            # 4. 再次清理GPU
+            self._deep_gpu_cleanup()
+            
+            # 5. 重新加载模型（如果需要）
+            if not self.is_loaded:
+                logger.info(f"尝试重新加载模型 (实例: {self._instance_id})")
+                self.load()
+            
+        except Exception as e:
+            logger.error(f"紧急清理时出错: {e}")
+    
+    def unload(self):
+        """卸载模型 - 增强版本"""
+        logger.info(f"开始卸载模型 (实例: {self._instance_id})")
+        
+        # 标记为未加载
+        self.is_loaded = False
+        
+        # 安全清理pipeline
+        self._safe_pipeline_cleanup()
+        
+        # 深度清理GPU
+        self._deep_gpu_cleanup()
+        
+        logger.info(f"模型 {self.model_id} 已完全卸载 (实例: {self._instance_id})")
     
     def get_default_params(self) -> Dict[str, Any]:
         """获取默认参数"""

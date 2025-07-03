@@ -315,35 +315,66 @@ class ConcurrentModelManager:
             except Exception as e:
                 logger.error(f"GPU工作线程 {instance.instance_id} 错误: {e}")
     
-    def _check_and_cleanup_memory(self, instance: ModelInstance):
-        """检查并清理内存"""
+    def _check_and_cleanup_memory(self, instance: ModelInstance, force_cleanup: bool = False):
+        """检查并清理内存 - 增强版本"""
         if not instance.device.startswith("cuda:"):
             return
         
         try:
             gpu_id = int(instance.device.split(":")[1])
-            allocated = torch.cuda.memory_allocated(gpu_id)
-            total = torch.cuda.get_device_properties(gpu_id).total_memory
-            usage_ratio = allocated / total
             
-            # 如果内存使用率超过80%，强制清理
-            if usage_ratio > 0.8:
-                logger.warning(f"GPU {gpu_id} 内存使用率过高 ({usage_ratio:.1%})，强制清理")
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats()
-                import gc
-                gc.collect()
-                torch.cuda.empty_cache()
+            # 确保在正确的GPU上下文中操作
+            with torch.cuda.device(gpu_id):
+                allocated = torch.cuda.memory_allocated(gpu_id)
+                total = torch.cuda.get_device_properties(gpu_id).total_memory
+                usage_ratio = allocated / total
+                
+                logger.debug(f"GPU {gpu_id} 内存使用率: {usage_ratio:.1%}")
+                
+                # 如果内存使用率超过95%或者强制清理，执行深度清理
+                if usage_ratio > 0.95 or force_cleanup:
+                    logger.warning(f"GPU {gpu_id} 内存使用率过高 ({usage_ratio:.1%})，执行深度清理")
+                    
+                    # 先尝试卸载并重新加载模型
+                    if hasattr(instance.model, '_emergency_cleanup'):
+                        instance.model._emergency_cleanup()
+                    else:
+                        # 备用清理方法
+                        torch.cuda.empty_cache()
+                        torch.cuda.reset_peak_memory_stats()
+                        import gc
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    
+                    # 检查清理效果
+                    new_allocated = torch.cuda.memory_allocated(gpu_id)
+                    new_usage_ratio = new_allocated / total
+                    logger.info(f"GPU {gpu_id} 清理后内存使用率: {new_usage_ratio:.1%}")
+                    
+                    # 如果清理效果不好，重新加载模型
+                    if new_usage_ratio > 0.6 and hasattr(instance.model, 'unload') and hasattr(instance.model, 'load'):
+                        logger.warning(f"GPU {gpu_id} 清理效果不佳，尝试重新加载模型")
+                        instance.model.unload()
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        gc.collect()
+                        time.sleep(1)  # 给系统一点时间
+                        success = instance.model.load()
+                        if not success:
+                            logger.error(f"重新加载模型失败")
+                        else:
+                            final_allocated = torch.cuda.memory_allocated(gpu_id)
+                            final_usage_ratio = final_allocated / total
+                            logger.info(f"GPU {gpu_id} 重新加载后内存使用率: {final_usage_ratio:.1%}")
                 
         except Exception as e:
             logger.warning(f"检查内存时出错: {e}")
     
     def _process_task_on_gpu(self, task: GenerationTask, instance: ModelInstance):
-        """在指定GPU上处理任务 - 使用GPU环境隔离"""
+        """在指定GPU上处理任务 - 增强版本"""
         logger.info(f"🚀 开始处理任务 {task.task_id[:8]} 在 {instance.device}")
         
-        # 注意：忙碌状态已经在全局调度器中设置，这里不需要重复设置
-
         # 设置GPU环境变量
         old_cuda_visible = None
         if instance.device.startswith("cuda:"):
@@ -379,19 +410,13 @@ class ConcurrentModelManager:
             import traceback
             logger.error(traceback.format_exc())
             
-            # 立即清理GPU显存
+            # 失败时执行强制清理
             try:
                 if instance.device.startswith("cuda:"):
-                    torch.cuda.empty_cache()
-                    torch.cuda.reset_peak_memory_stats()
-                    # 强制垃圾回收
-                    import gc
-                    gc.collect()
-                    # 再次清理缓存
-                    torch.cuda.empty_cache()
-                    logger.debug(f"已彻底清理GPU显存 (任务失败)")
+                    logger.warning(f"任务失败，对GPU {instance.device} 执行强制清理")
+                    self._check_and_cleanup_memory(instance, force_cleanup=True)
             except Exception as cleanup_error:
-                logger.warning(f"清理GPU显存时出错: {cleanup_error}")
+                logger.error(f"强制清理GPU显存时出错: {cleanup_error}")
             
             result = {
                 "success": False,
@@ -418,21 +443,16 @@ class ConcurrentModelManager:
             # 释放GPU
             instance.set_busy(False)
             
-            # 轻量级GPU缓存清理
+            # 任务完成后的标准清理
             try:
                 if instance.device.startswith("cuda:"):
-                    torch.cuda.empty_cache()
-                    torch.cuda.reset_peak_memory_stats()
-                    # 强制垃圾回收
-                    import gc
-                    gc.collect()
-                    # 再次清理缓存
-                    torch.cuda.empty_cache()
-                    logger.debug(f"已彻底清理GPU显存 (任务完成)")
+                    gpu_id = int(instance.device.split(":")[1])
+                    with torch.cuda.device(gpu_id):
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    logger.debug(f"已清理GPU {instance.device} 缓存")
             except Exception as e:
                 logger.warning(f"清理GPU缓存时出错: {e}")
-            
-            self._check_and_cleanup_memory(instance)
     
     async def generate_image_async(self, model_id: str, prompt: str, priority: int = 0, **kwargs) -> Dict[str, Any]:
         """异步生成图片 - 支持优先级"""
@@ -546,7 +566,7 @@ class ConcurrentModelManager:
         return models
     
     def shutdown(self):
-        """关闭管理器"""
+        """关闭管理器 - 增强版本"""
         logger.info("正在关闭并发模型管理器...")
         
         self.is_running = False
@@ -559,9 +579,35 @@ class ConcurrentModelManager:
         for worker in self.worker_threads:
             worker.join(timeout=5.0)
         
-        # 卸载所有模型
+        # 彻底卸载所有模型
         for instances in self.model_instances.values():
             for instance in instances:
-                instance.model.unload()
+                try:
+                    logger.info(f"卸载模型实例: {instance.instance_id}")
+                    instance.model.unload()
+                    
+                    # 强制清理这个实例使用的GPU
+                    if instance.device.startswith("cuda:"):
+                        gpu_id = int(instance.device.split(":")[1])
+                        with torch.cuda.device(gpu_id):
+                            torch.cuda.empty_cache()
+                            torch.cuda.reset_peak_memory_stats()
+                            torch.cuda.synchronize()
+                        logger.info(f"已清理GPU {instance.device}")
+                        
+                except Exception as e:
+                    logger.error(f"卸载实例 {instance.instance_id} 时出错: {e}")
+        
+        # 最终清理所有GPU
+        try:
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    with torch.cuda.device(i):
+                        torch.cuda.empty_cache()
+                        torch.cuda.reset_peak_memory_stats()
+                        torch.cuda.synchronize()
+                logger.info("已清理所有GPU")
+        except Exception as e:
+            logger.warning(f"最终GPU清理时出错: {e}")
         
         logger.info("并发模型管理器已关闭") 
