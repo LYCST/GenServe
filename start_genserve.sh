@@ -18,7 +18,7 @@ fi
 
 # 设置环境变量
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:32,garbage_collection_threshold:0.8,roundup_power2_divisions:16"
-export FLUX_GPUS="0,1,2,3"
+export FLUX_GPUS="0,1,2"
 # CPU Offload配置（针对24GB显存不足）
 export ENABLE_CPU_OFFLOAD="true"
 export CPU_OFFLOAD_AGGRESSIVE="true"

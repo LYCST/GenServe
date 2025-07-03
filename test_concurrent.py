@@ -127,7 +127,7 @@ class EnhancedConcurrentTester:
         """生成单张图片并记录详细信息"""
         payload = {
             "prompt": prompt,
-            "model": "flux1-dev",
+            "model_id": "flux1-dev",  # 修正字段名
             "num_inference_steps": 20,
             "height": 512,
             "width": 512,
@@ -152,34 +152,35 @@ class EnhancedConcurrentTester:
             
             result.end_time = time.time()
             
-            if "error" not in response_data:
+            # 检查响应是否成功
+            if response_data.get("success", False):
                 result.success = True
-                result.device = response_data.get("device", "unknown")
-                result.worker = response_data.get("worker", "unknown")
+                result.device = response_data.get("gpu_id", "unknown")  # 映射 gpu_id -> device
+                result.worker = response_data.get("model_id", "unknown")  # 映射 model_id -> worker
                 result.task_id = response_data.get("task_id", "")
                 
-                # 解析生成时间
-                elapsed_str = response_data.get("elapsed_time", "0s")
-                if elapsed_str.endswith('s'):
-                    try:
-                        result.generation_time = float(elapsed_str[:-1])
-                    except:
-                        result.generation_time = 0.0
+                # 解析生成时间 - elapsed_time 是 float 类型
+                elapsed_time = response_data.get("elapsed_time", 0.0)
+                if isinstance(elapsed_time, (int, float)):
+                    result.generation_time = float(elapsed_time)
+                else:
+                    result.generation_time = 0.0
                 
                 # 计算队列等待时间
                 total_time = result.end_time - result.start_time
                 result.queue_wait_time = max(0, total_time - result.generation_time)
                 
-                # 保存图片（可选）
-                if response_data.get("output") and os.getenv("SAVE_TEST_IMAGES", "false").lower() == "true":
+                # 保存图片（可选）- 映射 image_base64 -> output
+                if response_data.get("image_base64") and os.getenv("SAVE_TEST_IMAGES", "false").lower() == "true":
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     image_path = f"test_{request_id}_{timestamp}.png"
                     
-                    image_data = base64.b64decode(response_data["output"])
+                    image_data = base64.b64decode(response_data["image_base64"])
                     with open(image_path, "wb") as f:
                         f.write(image_data)
             else:
-                result.error = response_data["error"]
+                # 处理失败情况
+                result.error = response_data.get("error", "未知错误")
                 
         except Exception as e:
             result.end_time = time.time()
@@ -202,16 +203,52 @@ class EnhancedConcurrentTester:
                 future = executor.submit(self.generate_single_image, prompt, request_id)
                 future_to_request[future] = request_id
             
-            # 收集结果
-            for future in as_completed(future_to_request):
-                try:
-                    result = future.result()
-                    print(result)   
-                    results.append(result)
-                    print(f"✅ 请求 {future_to_request[future]} 完成: {'成功' if result.success else '失败'}")
-                except Exception as e:
-                    print(f"❌ 请求 {future_to_request[future]} 异常: {e}")
+            # 收集结果，设置超时
+            print(f"⏳ 等待 {burst_size} 个请求完成...")
+            timeout_start = time.time()
+            timeout_duration = 120.0  # 2分钟总体超时
+            
+            try:
+                for future in as_completed(future_to_request):
+                    # 检查是否超时
+                    if time.time() - timeout_start > timeout_duration:
+                        print(f"⚠️ 突发测试超时，跳过剩余 {len(future_to_request)} 个任务")
+                        break
+                        
+                    try:
+                        result = future.result(timeout=10.0)  # 单个任务10秒超时
+                        print(result)   
+                        results.append(result)
+                        print(f"✅ 请求 {future_to_request[future]} 完成: {'成功' if result.success else '失败'}")
+                    except Exception as e:
+                        print(f"❌ 请求 {future_to_request[future]} 异常: {e}")
+                        # 即使异常也要记录失败结果
+                        failed_result = TestResult(
+                            request_id=future_to_request[future],
+                            prompt="",
+                            start_time=time.time(),
+                            end_time=time.time(),
+                            success=False,
+                            error=str(e)
+                        )
+                        results.append(failed_result)
+                        
+            except KeyboardInterrupt:
+                print(f"\n⚠️ 测试被用户中断")
+                # 记录剩余任务为失败
+                for future in future_to_request:
+                    if future not in [r.request_id for r in results]:
+                        failed_result = TestResult(
+                            request_id=future_to_request[future],
+                            prompt="",
+                            start_time=time.time(),
+                            end_time=time.time(),
+                            success=False,
+                            error="测试被中断"
+                        )
+                        results.append(failed_result)
         
+        print(f"📊 突发测试统计: 提交 {burst_size} 个请求，完成 {len(results)} 个结果")
         self.test_results.extend(results)
         return results
     
@@ -222,6 +259,7 @@ class EnhancedConcurrentTester:
         end_time = time.time() + duration
         results = []
         request_count = 0
+        submitted_count = 0
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_request = {}
@@ -237,17 +275,19 @@ class EnhancedConcurrentTester:
                         break
                     
                     prompt = prompts[request_count % len(prompts)]
-                    request_id = f"sustained_{request_count+1}_{uuid.uuid4().hex[:8]}"
+                    request_id = f"sustained_{submitted_count+1}_{uuid.uuid4().hex[:8]}"
                     future = executor.submit(self.generate_single_image, prompt, request_id)
                     future_to_request[future] = request_id
                     request_count += 1
+                    submitted_count += 1
                 
                 # 收集已完成的结果
                 completed_futures = []
                 for future in list(future_to_request.keys()):
                     if future.done():
                         try:
-                            result = future.result()
+                            # 设置超时，避免卡住
+                            result = future.result(timeout=10.0)  # 10秒超时
                             print(result)   
                             results.append(result)
                             print(f"✅ 请求 {future_to_request[future]} 完成: {'成功' if result.success else '失败'}")
@@ -262,17 +302,56 @@ class EnhancedConcurrentTester:
                 # 等待一段时间
                 time.sleep(interval)
             
-            # 等待剩余任务完成
-            print(f"⏳ 等待剩余 {len(future_to_request)} 个任务完成...")
-            for future in as_completed(future_to_request):
+            # 等待剩余任务完成，设置总体超时
+            remaining_count = len(future_to_request)
+            if remaining_count > 0:
+                print(f"⏳ 等待剩余 {remaining_count} 个任务完成...")
+                
+                # 设置总体超时时间
+                timeout_start = time.time()
+                timeout_duration = 60.0  # 60秒总体超时
+                
                 try:
-                    result = future.result()
-                    print(result)   
-                    results.append(result)
-                    print(f"✅ 请求 {future_to_request[future]} 完成: {'成功' if result.success else '失败'}")
-                except Exception as e:
-                    print(f"❌ 请求 {future_to_request[future]} 异常: {e}")
+                    for future in as_completed(future_to_request):
+                        # 检查是否超时
+                        if time.time() - timeout_start > timeout_duration:
+                            print(f"⚠️ 等待剩余任务超时，跳过剩余 {len(future_to_request)} 个任务")
+                            break
+                            
+                        try:
+                            result = future.result(timeout=5.0)  # 单个任务5秒超时
+                            print(result)   
+                            results.append(result)
+                            print(f"✅ 请求 {future_to_request[future]} 完成: {'成功' if result.success else '失败'}")
+                        except Exception as e:
+                            print(f"❌ 请求 {future_to_request[future]} 异常: {e}")
+                            # 即使异常也要记录失败结果
+                            failed_result = TestResult(
+                                request_id=future_to_request[future],
+                                prompt="",
+                                start_time=time.time(),
+                                end_time=time.time(),
+                                success=False,
+                                error=str(e)
+                            )
+                            results.append(failed_result)
+                            
+                except KeyboardInterrupt:
+                    print(f"\n⚠️ 测试被用户中断")
+                    # 记录剩余任务为失败
+                    for future in future_to_request:
+                        if future not in [r.request_id for r in results]:
+                            failed_result = TestResult(
+                                request_id=future_to_request[future],
+                                prompt="",
+                                start_time=time.time(),
+                                end_time=time.time(),
+                                success=False,
+                                error="测试被中断"
+                            )
+                            results.append(failed_result)
         
+        print(f"📊 持续负载测试统计: 提交 {submitted_count} 个请求，完成 {len(results)} 个结果")
         self.test_results.extend(results)
         return results
     

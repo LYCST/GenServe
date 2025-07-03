@@ -111,6 +111,38 @@ class ProcessConcurrentModelManager:
         self.scheduler_thread.daemon = True
         self.scheduler_thread.start()
         logger.info("进程级全局调度器已启动")
+        
+        # 启动进程监控线程
+        self.monitor_thread = threading.Thread(
+            target=self._process_monitor_loop,
+            name="process-monitor"
+        )
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+        logger.info("进程监控线程已启动")
+    
+    def _process_monitor_loop(self):
+        """进程监控循环 - 定期检查死亡进程并重启"""
+        logger.info("进程监控线程开始运行")
+        
+        while self.is_running:
+            try:
+                # 每30秒检查一次进程状态
+                time.sleep(30)
+                
+                # 检查并重启死亡进程
+                restart_results = self.gpu_manager.check_and_restart_dead_processes()
+                
+                if restart_results:
+                    logger.info(f"进程监控: 检查了 {len(restart_results)} 个进程")
+                    for process_key, success in restart_results.items():
+                        if success:
+                            logger.info(f"✅ 进程 {process_key} 重启成功")
+                        else:
+                            logger.warning(f"⚠️ 进程 {process_key} 重启失败")
+                
+            except Exception as e:
+                logger.error(f"进程监控循环错误: {e}")
     
     def _global_scheduler_loop(self):
         """全局调度器循环 - 智能任务分配"""
@@ -309,6 +341,12 @@ class ProcessConcurrentModelManager:
         # 计算总体统计
         total_processes = sum(len(gpus) for gpus in self.model_instances.values())
         alive_processes = sum(1 for status in gpu_status.values() if status["alive"])
+        dead_processes = total_processes - alive_processes
+        
+        # 统计重启信息
+        total_restarts = sum(status.get("restart_attempts", 0) for status in gpu_status.values())
+        max_restarts_reached = sum(1 for status in gpu_status.values() 
+                                 if status.get("restart_attempts", 0) >= status.get("max_restart_attempts", 3))
         
         return {
             "is_running": self.is_running,
@@ -316,6 +354,9 @@ class ProcessConcurrentModelManager:
             "max_global_queue_size": self.max_global_queue_size,
             "total_processes": total_processes,
             "alive_processes": alive_processes,
+            "dead_processes": dead_processes,
+            "total_restarts": total_restarts,
+            "max_restarts_reached": max_restarts_reached,
             "load_balance_strategy": self.load_balance_strategy,
             "task_timeout": self.task_timeout,
             "stats": self.stats.copy(),
@@ -353,6 +394,10 @@ class ProcessConcurrentModelManager:
         # 等待调度器线程结束
         if self.scheduler_thread:
             self.scheduler_thread.join(timeout=5.0)
+        
+        # 等待监控线程结束
+        if hasattr(self, 'monitor_thread') and self.monitor_thread:
+            self.monitor_thread.join(timeout=5.0)
         
         # 关闭GPU隔离管理器
         self.gpu_manager.shutdown()
