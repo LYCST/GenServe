@@ -125,8 +125,8 @@ class ProcessConcurrentModelManager:
                 best_gpu_id = self._find_best_gpu(task.model_id)
                 
                 if best_gpu_id:
-                    # 分配任务给GPU进程
-                    self._process_task_on_gpu_process(task, best_gpu_id)
+                    # 异步分配任务给GPU进程，不等待完成
+                    self._submit_task_async(task, best_gpu_id)
                     logger.info(f"任务 {task.task_id} 已分配给GPU {best_gpu_id}")
                 else:
                     # 所有GPU都忙碌，重新放回队列
@@ -164,6 +164,17 @@ class ProcessConcurrentModelManager:
         
         logger.debug(f"负载均衡: 模型 {model_id} 选择GPU {selected_gpu} (索引: {gpu_index}/{len(available_gpus)})")
         return selected_gpu
+    
+    def _submit_task_async(self, task: GenerationTask, gpu_id: str):
+        """异步提交任务到GPU进程"""
+        # 创建后台线程处理任务，不阻塞调度器
+        thread = threading.Thread(
+            target=self._process_task_on_gpu_process,
+            args=(task, gpu_id),
+            name=f"task-{task.task_id[:8]}"
+        )
+        thread.daemon = True
+        thread.start()
     
     def _process_task_on_gpu_process(self, task: GenerationTask, gpu_id: str):
         """在GPU进程中处理任务"""
