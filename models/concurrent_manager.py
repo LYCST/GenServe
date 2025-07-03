@@ -306,45 +306,68 @@ class ConcurrentModelManager:
                 instance.set_busy(False)
     
     def _process_task_on_gpu(self, task: GenerationTask, instance: ModelInstance):
-        """在指定GPU上处理任务"""
+        """在GPU上处理任务 - 线程级GPU隔离版本"""
         logger.info(f"开始处理任务 {task.task_id[:8]} (实例: {instance.instance_id})")
         
         try:
-            # 模型已经在初始化时设置了正确的GPU，直接生成即可
+            # 更新模型设备配置
+            if hasattr(instance.model, '_update_device_for_task'):
+                instance.model._update_device_for_task(instance.device)
+            
+            # 执行生成任务 - 模型内部会使用torch.cuda.set_device()进行线程级隔离
             result = instance.model.generate(task.prompt, **task.params)
             
+            # 添加任务信息
             result.update({
                 "task_id": task.task_id,
                 "device": instance.device,
-                "worker": instance.instance_id,
-                "physical_gpu_id": instance.physical_gpu_id,
-                "queue_wait_time": time.time() - task.created_at
+                "instance_id": instance.instance_id,
+                "physical_gpu": instance.physical_gpu_id,
+                "thread_name": threading.current_thread().name
             })
             
-            # 返回结果
+            # 发送结果
             task.result_queue.put(result)
             
             # 更新统计
-            self.stats["completed_tasks"] += 1
-            
-            logger.info(f"✅ 任务 {task.task_id[:8]} 完成，设备: {instance.device}，耗时: {result.get('elapsed_time', 0):.2f}秒")
+            if result.get("success", False):
+                self.stats["completed_tasks"] += 1
+                instance.total_generations += 1
+                logger.info(f"✅ 任务 {task.task_id[:8]} 完成 (实例: {instance.instance_id})")
+            else:
+                self.stats["failed_tasks"] += 1
+                logger.error(f"❌ 任务 {task.task_id[:8]} 失败: {result.get('error', '未知错误')}")
             
         except Exception as e:
-            logger.error(f"❌ 任务 {task.task_id[:8]} 失败: {e}")
+            logger.error(f"❌ 处理任务 {task.task_id[:8]} 时发生错误: {e}")
             import traceback
             logger.error(traceback.format_exc())
+            
+            # 失败时执行强制清理
+            try:
+                if instance.device.startswith("cuda:"):
+                    logger.warning(f"任务失败，对GPU {instance.device} 执行强制清理")
+                    self._check_and_cleanup_memory(instance, force_cleanup=True)
+            except Exception as cleanup_error:
+                logger.error(f"强制清理GPU显存时出错: {cleanup_error}")
             
             result = {
                 "success": False,
                 "error": str(e),
                 "task_id": task.task_id,
                 "device": instance.device,
-                "worker": instance.instance_id
+                "instance_id": instance.instance_id,
+                "physical_gpu": instance.physical_gpu_id,
+                "thread_name": threading.current_thread().name
             }
             task.result_queue.put(result)
             
             # 更新统计
             self.stats["failed_tasks"] += 1
+            
+        finally:
+            # 释放GPU
+            instance.set_busy(False)
     
     async def generate_image_async(self, model_id: str, prompt: str, priority: int = 0, **kwargs) -> Dict[str, Any]:
         """异步生成图片 - 支持优先级"""
