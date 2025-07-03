@@ -15,10 +15,7 @@ class Config:
     DEFAULT_GPU_DEVICE = os.getenv("DEFAULT_GPU_DEVICE", "0")
     
     # PyTorch内存管理配置
-    PYTORCH_CUDA_ALLOC_CONF = os.getenv(
-        "PYTORCH_CUDA_ALLOC_CONF", 
-        "expandable_segments:True,max_split_size_mb:32,garbage_collection_threshold:0.8,roundup_power2_divisions:16"
-    )
+    PYTORCH_CUDA_ALLOC_CONF = os.getenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.6")
     
     # 日志配置
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -35,21 +32,13 @@ class Config:
     MEMORY_EFFICIENT_ATTENTION = os.getenv("MEMORY_EFFICIENT_ATTENTION", "true").lower() == "true"
     ENABLE_CPU_OFFLOAD = os.getenv("ENABLE_CPU_OFFLOAD", "true").lower() == "true"
     
-    # CPU Offload配置 - 针对24GB显存不足的情况
-    CPU_OFFLOAD_AGGRESSIVE = os.getenv("CPU_OFFLOAD_AGGRESSIVE", "true").lower() == "true"  # 激进模式
-    
-    # FluxPipeline特定配置
-    FLUX_USE_CPU_OFFLOAD = os.getenv("FLUX_USE_CPU_OFFLOAD", "true").lower() == "true"
-    FLUX_OFFLOAD_TEXT_ENCODER = os.getenv("FLUX_OFFLOAD_TEXT_ENCODER", "true").lower() == "true"
-    FLUX_OFFLOAD_VAE = os.getenv("FLUX_OFFLOAD_VAE", "true").lower() == "true"
-    
     # API配置
     ENABLE_CORS = os.getenv("ENABLE_CORS", "true").lower() == "true"
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
     
-    # 并发配置
-    MAX_GLOBAL_QUEUE_SIZE = int(os.getenv("MAX_GLOBAL_QUEUE_SIZE", "100"))
-    MAX_GPU_QUEUE_SIZE = int(os.getenv("MAX_GPU_QUEUE_SIZE", "10"))
+    # 并发配置 - 为8卡4090优化
+    MAX_GLOBAL_QUEUE_SIZE = int(os.getenv("MAX_GLOBAL_QUEUE_SIZE", "50"))  # 减少全局队列大小
+    MAX_GPU_QUEUE_SIZE = int(os.getenv("MAX_GPU_QUEUE_SIZE", "5"))  # 每个GPU最多5个排队任务
     TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT", "300"))  # 5分钟
     SCHEDULER_SLEEP_TIME = float(os.getenv("SCHEDULER_SLEEP_TIME", "0.1"))
     
@@ -227,24 +216,3 @@ class Config:
         print(f"  负载均衡策略: {config['concurrent']['load_balance_strategy']}")
         
         print("=" * 50)
-    
-    @classmethod
-    def get_flux_config(cls) -> Dict[str, Any]:
-        """获取Flux模型特定配置"""
-        return {
-            "use_cpu_offload": cls.FLUX_USE_CPU_OFFLOAD,
-            "offload_text_encoder": cls.FLUX_OFFLOAD_TEXT_ENCODER,
-            "offload_vae": cls.FLUX_OFFLOAD_VAE,
-            "aggressive_offload": cls.CPU_OFFLOAD_AGGRESSIVE,
-            "torch_dtype": cls.get_torch_dtype()
-        }
-    
-    @classmethod
-    def get_memory_config(cls) -> Dict[str, Any]:
-        """获取内存管理配置"""
-        return {
-            "enable_cpu_offload": cls.ENABLE_CPU_OFFLOAD,
-            "aggressive_offload": cls.CPU_OFFLOAD_AGGRESSIVE,
-            "pytorch_cuda_alloc_conf": cls.PYTORCH_CUDA_ALLOC_CONF,
-            "memory_efficient_attention": cls.MEMORY_EFFICIENT_ATTENTION
-        } 
