@@ -36,11 +36,17 @@ class Config:
     ENABLE_CORS = os.getenv("ENABLE_CORS", "true").lower() == "true"
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
     
-    # 并发配置 - 为8卡4090优化
-    MAX_GLOBAL_QUEUE_SIZE = int(os.getenv("MAX_GLOBAL_QUEUE_SIZE", "50"))  # 减少全局队列大小
-    MAX_GPU_QUEUE_SIZE = int(os.getenv("MAX_GPU_QUEUE_SIZE", "5"))  # 每个GPU最多5个排队任务
-    TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT", "300"))  # 5分钟
-    SCHEDULER_SLEEP_TIME = float(os.getenv("SCHEDULER_SLEEP_TIME", "0.1"))
+    # 并发配置
+    MAX_CONCURRENT_REQUESTS = 10
+    TASK_TIMEOUT = 180  # 任务超时时间（秒）- 减少到3分钟
+    SCHEDULER_SLEEP_TIME = 0.1  # 调度器睡眠时间（秒）
+    MAX_GLOBAL_QUEUE_SIZE = 100  # 全局队列最大大小
+    MAX_GPU_QUEUE_SIZE = 5  # 每个GPU队列最大大小
+    LOAD_BALANCE_STRATEGY = "round_robin"  # 负载均衡策略: round_robin, least_busy
+    GPU_TASK_CLEANUP_WAIT_TIME = 1.5  # GPU任务完成后清理等待时间（秒）- 进一步减少到1.5秒
+    GPU_MEMORY_THRESHOLD_MB = 800  # GPU内存阈值，超过此值强制清理（MB）- 降低阈值
+    GPU_MEMORY_CLEANUP_INTERVAL = 5  # GPU内存清理间隔（秒）
+    ENABLE_AGGRESSIVE_CLEANUP = True  # 启用激进内存清理
     
     # 模型GPU配置 - 支持更灵活的配置
     @classmethod

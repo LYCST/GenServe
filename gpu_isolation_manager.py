@@ -8,6 +8,8 @@ import signal
 import sys
 import traceback
 import queue
+import gc
+import psutil
 
 # mp.set_start_method('spawn', force=True)
 
@@ -24,12 +26,29 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
     import queue
     import logging
     import time
+    import gc
+    import psutil
 
     logger = logging.getLogger(f"gpu_worker_{gpu_id}")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-    logger.info(f"🚀 GPU {gpu_id} 工作进程启动 (PID: {os.getpid()})")
+    
+    # 设置进程优先级和内存限制
+    try:
+        process = psutil.Process()
+        process.nice(10)  # 降低进程优先级，减少被OOM Killer杀死的概率
+        logger.info(f"🚀 GPU {gpu_id} 工作进程启动 (PID: {os.getpid()}, 优先级: {process.nice()})")
+    except Exception as e:
+        logger.warning(f"无法设置进程优先级: {e}")
+        logger.info(f"🚀 GPU {gpu_id} 工作进程启动 (PID: {os.getpid()})")
+    
     try:
         logger.info(f"正在加载模型到GPU {gpu_id}...")
+        
+        # 加载前清理内存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
         pipe = FluxPipeline.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
@@ -38,22 +57,127 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
         )
         pipe.enable_model_cpu_offload(device="cuda:0")
         logger.info(f"✅ 模型已加载到GPU {gpu_id}")
+        
+        task_count = 0
+        consecutive_failures = 0  # 连续失败计数
+        max_consecutive_failures = 3  # 最大连续失败次数
+        last_cleanup_time = time.time()  # 上次清理时间
+        
         while True:
             try:
+                # 定期内存清理
+                current_time = time.time()
+                from config import Config
+                if current_time - last_cleanup_time > Config.GPU_MEMORY_CLEANUP_INTERVAL:
+                    if torch.cuda.is_available():
+                        allocated = torch.cuda.memory_allocated() / 1024**2
+                        if allocated > Config.GPU_MEMORY_THRESHOLD_MB:
+                            logger.info(f"GPU {gpu_id} 定期清理内存 (已分配: {allocated:.1f}MB)")
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            gc.collect()
+                    last_cleanup_time = current_time
+                
                 task = task_queue.get(timeout=1.0)
                 if task is None:
                     logger.info(f"GPU {gpu_id} 收到退出信号")
                     break
-                logger.info(f"GPU {gpu_id} 开始处理任务: {task.get('task_id', 'unknown')}")
+                
+                task_count += 1
+                logger.info(f"GPU {gpu_id} 开始处理任务 #{task_count}: {task.get('task_id', 'unknown')}")
+                
+                # 任务开始前检查内存状态
+                if torch.cuda.is_available():
+                    initial_allocated = torch.cuda.memory_allocated() / 1024**2
+                    initial_cached = torch.cuda.memory_reserved() / 1024**2
+                    logger.info(f"GPU {gpu_id} 任务开始前内存: 已分配 {initial_allocated:.1f}MB, 缓存 {initial_cached:.1f}MB")
+                    
+                    # 如果内存使用过高，强制清理
+                    if initial_allocated > Config.GPU_MEMORY_THRESHOLD_MB:
+                        logger.warning(f"GPU {gpu_id} 内存使用过高 ({initial_allocated:.1f}MB > {Config.GPU_MEMORY_THRESHOLD_MB}MB)，强制清理")
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        gc.collect()
+                
+                # 处理任务
                 result = process_generation_task(pipe, task, gpu_id)
                 result_queue.put(result)
-                logger.info(f"GPU {gpu_id} 任务处理完成: {result.get('success', False)}")
+                
+                success = result.get('success', False)
+                logger.info(f"GPU {gpu_id} 任务 #{task_count} 处理完成: {success}")
+                
+                # 更新连续失败计数
+                if success:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                
+                # 任务完成后进行清理和等待
+                if success:
+                    logger.info(f"GPU {gpu_id} 开始清理资源...")
+                    
+                    # 更激进的内存清理
+                    if torch.cuda.is_available():
+                        # 多次清理确保彻底
+                        for i in range(3):
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            time.sleep(0.1)
+                        
+                        torch.cuda.reset_peak_memory_stats()
+                        
+                        # 如果启用激进清理，进行额外清理
+                        if Config.ENABLE_AGGRESSIVE_CLEANUP:
+                            # 强制垃圾回收多次
+                            for i in range(2):
+                                gc.collect()
+                                time.sleep(0.05)
+                    
+                    # 强制垃圾回收
+                    gc.collect()
+                    
+                    # 等待一段时间确保清理完成
+                    cleanup_wait_time = Config.GPU_TASK_CLEANUP_WAIT_TIME
+                    logger.info(f"GPU {gpu_id} 等待 {cleanup_wait_time} 秒确保清理完成...")
+                    time.sleep(cleanup_wait_time)
+                    
+                    # 记录清理后的内存状态
+                    if torch.cuda.is_available():
+                        allocated = torch.cuda.memory_allocated() / 1024**2
+                        cached = torch.cuda.memory_reserved() / 1024**2
+                        logger.info(f"GPU {gpu_id} 清理后内存: 已分配 {allocated:.1f}MB, 缓存 {cached:.1f}MB")
+                        
+                        # 如果内存仍然过高，进行额外清理
+                        if allocated > Config.GPU_MEMORY_THRESHOLD_MB:
+                            logger.warning(f"GPU {gpu_id} 清理后内存仍然过高 ({allocated:.1f}MB)，进行额外清理")
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            gc.collect()
+                    
+                    logger.info(f"GPU {gpu_id} 清理完成，准备接收下一个任务")
+                else:
+                    logger.warning(f"GPU {gpu_id} 任务失败，跳过清理等待")
+                    
+                    # 失败后也要清理内存
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        gc.collect()
+                
+                # 检查连续失败次数
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.error(f"GPU {gpu_id} 连续失败 {consecutive_failures} 次，准备重启进程")
+                    break
+                
             except queue.Empty:
                 continue
             except Exception as e:
                 error_msg = f"GPU {gpu_id} 处理任务时出错: {str(e)}"
                 logger.error(error_msg)
                 logger.error(f"错误详情: {traceback.format_exc()}")
+                
+                consecutive_failures += 1
+                
                 try:
                     result_queue.put({
                         "success": False,
@@ -63,9 +187,19 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
                     })
                 except Exception as put_error:
                     logger.error(f"GPU {gpu_id} 无法返回错误结果: {put_error}")
-        logger.info(f"GPU {gpu_id} 开始清理资源...")
+                
+                # 异常后清理内存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    gc.collect()
+        
+        logger.info(f"GPU {gpu_id} 开始最终清理资源...")
         del pipe
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
         logger.info(f"GPU {gpu_id} 工作进程退出")
     except Exception as e:
         error_msg = f"GPU {gpu_id} 工作进程启动失败: {str(e)}"
@@ -88,9 +222,17 @@ def process_generation_task(pipe, task, gpu_id: str):
     import traceback
     logger = logging.getLogger(f"gpu_worker_{gpu_id}")
     start_time = time.time()
+    
+    # 记录任务开始时的内存状态
+    if torch.cuda.is_available():
+        initial_allocated = torch.cuda.memory_allocated() / 1024**2
+        initial_cached = torch.cuda.memory_reserved() / 1024**2
+        logger.info(f"GPU {gpu_id} 任务开始前内存: 已分配 {initial_allocated:.1f}MB, 缓存 {initial_cached:.1f}MB")
+    
     try:
         logger.info(f"GPU {gpu_id} 开始生成任务: {task.get('task_id', 'unknown')}")
         generator = torch.Generator("cpu").manual_seed(task.get('seed', 42))
+        
         with torch.no_grad():
             result = pipe(
                 prompt=task['prompt'],
@@ -101,18 +243,40 @@ def process_generation_task(pipe, task, gpu_id: str):
                 max_sequence_length=512,
                 generator=generator
             )
+        
         image = result.images[0]
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
         img_base64 = base64.b64encode(buffer.getvalue()).decode()
         elapsed_time = time.time() - start_time
+        
+        # 记录任务完成时的内存状态
+        if torch.cuda.is_available():
+            final_allocated = torch.cuda.memory_allocated() / 1024**2
+            final_cached = torch.cuda.memory_reserved() / 1024**2
+            memory_increase = final_allocated - initial_allocated
+            logger.info(f"GPU {gpu_id} 任务完成后内存: 已分配 {final_allocated:.1f}MB (+{memory_increase:.1f}MB), 缓存 {final_cached:.1f}MB")
+        
         logger.info(f"GPU {gpu_id} 生成成功，耗时: {elapsed_time:.2f}秒")
+        
+        # 处理保存到磁盘
+        save_to_disk = False
+        save_path = task.get('save_disk_path')
+        if save_path:
+            try:
+                image.save(save_path)
+                save_to_disk = True
+                logger.info(f"GPU {gpu_id} 图片已保存到: {save_path}")
+            except Exception as e:
+                logger.warning(f"GPU {gpu_id} 保存图片失败: {e}")
+        
         return {
             "success": True,
             "image_base64": img_base64,
             "elapsed_time": elapsed_time,
             "gpu_id": gpu_id,
             "task_id": task.get('task_id'),
+            "save_to_disk": save_to_disk,
             "params": task
         }
     except Exception as e:
@@ -120,6 +284,13 @@ def process_generation_task(pipe, task, gpu_id: str):
         error_msg = f"GPU {gpu_id} 生成失败: {str(e)}"
         logger.error(error_msg)
         logger.error(f"生成错误详情: {traceback.format_exc()}")
+        
+        # 记录错误时的内存状态
+        if torch.cuda.is_available():
+            error_allocated = torch.cuda.memory_allocated() / 1024**2
+            error_cached = torch.cuda.memory_reserved() / 1024**2
+            logger.error(f"GPU {gpu_id} 错误时内存: 已分配 {error_allocated:.1f}MB, 缓存 {error_cached:.1f}MB")
+        
         return {
             "success": False,
             "error": str(e),
