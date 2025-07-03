@@ -9,6 +9,8 @@ from .base import BaseModel
 from config import Config
 import logging
 import os
+import threading
+import gc
 
 logger = logging.getLogger(__name__)
 
@@ -23,15 +25,27 @@ class FluxModel(BaseModel):
             gpu_device=gpu_device
         )
         self.model_path = Config.get_model_path("flux1-dev")
+        # 添加线程锁保护
+        self._generation_lock = threading.Lock()
+        # 为每个实例创建唯一标识
+        self._instance_id = f"flux_{gpu_device}_{id(self)}"
+        logger.info(f"创建FluxModel实例: {self._instance_id}")
+
+        # 获取GPU ID用于环境变量设置
+        self.gpu_id = self._get_gpu_id_from_device(self.gpu_device)
+
+    def _get_gpu_id_from_device(self, device: str) -> str:
+        """从设备名称提取GPU ID"""
+        if device == "cpu":
+            return "cpu"
+        elif device.startswith("cuda:"):
+            return device.split(":")[1]
+        else:
+            return "0"  # 默认使用GPU 0
     
     def load(self) -> bool:
         """加载Flux模型"""
         try:
-            # 选择最佳GPU进行加载
-            best_gpu = self._select_best_gpu()
-            logger.info(f"正在加载模型: {self.model_name} 到设备: {best_gpu}")
-            logger.info(f"模型路径: {self.model_path}")
-            
             # 检查模型路径是否存在
             if not os.path.exists(self.model_path):
                 logger.error(f"模型路径不存在: {self.model_path}")
@@ -39,9 +53,14 @@ class FluxModel(BaseModel):
             
             # 尝试多种加载方式
             load_success = False
+
+            # 只有在使用GPU时才设置环境变量
+            if self.gpu_id != "cpu":
+                logger.info(f"正在加载模型: {self.model_name} 到设备: {self.gpu_device} (实例: {self._instance_id})")
+                logger.info(f"模型路径: {self.model_path}")
             
-            # 方法1：使用FluxPipeline with CPU offload
             try:
+                # 使用FluxPipeline with CPU offload
                 logger.info("尝试使用FluxPipeline加载模型...")
                 self.pipe = FluxPipeline.from_pretrained(
                     self.model_path,
@@ -49,69 +68,45 @@ class FluxModel(BaseModel):
                     use_safetensors=True,
                     local_files_only=True
                 )
-                # 启用CPU卸载以节省GPU内存 - 不指定gpu_id让其自动选择
-                self.pipe.enable_model_cpu_offload()
+                
+                # 根据设备类型进行不同的处理
+                if self.gpu_device.startswith("cuda:"):
+                    # 对于GPU设备，使用CPU offload并指定设备
+                    self.pipe.enable_model_cpu_offload(device=self.gpu_device)
+                    logger.info(f"FluxPipeline with CPU offload加载成功，目标设备: {self.gpu_device} (实例: {self._instance_id})")
+                else:
+                    # 对于CPU设备，直接使用CPU
+                    self.pipe = self.pipe.to("cpu")
+                    logger.info(f"FluxPipeline加载到CPU成功 (实例: {self._instance_id})")
+                
                 load_success = True
-                logger.info("FluxPipeline with CPU offload加载成功")
                 
             except Exception as e:
-                logger.warning(f"FluxPipeline加载失败: {e}")
+                logger.error(f"模型加载失败: {e}")
+                return False
                 
-                # 方法2：使用DiffusionPipeline with CPU offload
-                try:
-                    logger.info("尝试使用DiffusionPipeline加载模型...")
-                    from diffusers import DiffusionPipeline
-                    self.pipe = DiffusionPipeline.from_pretrained(
-                        self.model_path,
-                        torch_dtype=torch.bfloat16,
-                        use_safetensors=True,
-                        local_files_only=True
-                    )
-                    # 启用CPU卸载 - 不指定gpu_id
-                    self.pipe.enable_model_cpu_offload()
-                    load_success = True
-                    logger.info("DiffusionPipeline with CPU offload加载成功")
-                    
-                except Exception as e2:
-                    logger.warning(f"DiffusionPipeline加载失败: {e2}")
-                    
-                    # 方法3：使用更宽松的参数
-                    try:
-                        logger.info("尝试使用宽松参数加载模型...")
-                        from diffusers import DiffusionPipeline
-                        self.pipe = DiffusionPipeline.from_pretrained(
-                            self.model_path,
-                            torch_dtype=torch.float16,  # 改用float16
-                            local_files_only=True,
-                            trust_remote_code=True
-                        )
-                        # 启用CPU卸载 - 不指定gpu_id
-                        self.pipe.enable_model_cpu_offload()
-                        load_success = True
-                        logger.info("宽松参数with CPU offload加载成功")
-                        
-                    except Exception as e3:
-                        logger.error(f"所有加载方法都失败了: {e3}")
-                        return False
-            
             if not load_success:
                 return False
             
-            # 不手动移动到GPU，让CPU offload自动管理
-            self.gpu_device = best_gpu
-            logger.info(f"模型 {self.model_name} 已启用CPU offload，目标GPU: {best_gpu.upper()}")
+            logger.info(f"模型 {self.model_name} 加载完成，设备: {self.gpu_device} (实例: {self._instance_id})")
             
             self.is_loaded = True
-            logger.info(f"模型 {self.model_name} 加载完成")
+            logger.info(f"模型 {self.model_name} 加载完成 (实例: {self._instance_id})")
             return True
             
         except Exception as e:
-            logger.error(f"模型 {self.model_name} 加载失败: {e}")
+            logger.error(f"模型 {self.model_name} 加载失败: {e} (实例: {self._instance_id})")
             self.is_loaded = False
             return False
     
     def generate(self, prompt: str, **kwargs) -> Dict[str, Any]:
-        """生成图片"""
+        """生成图片 - 线程安全版本"""
+        # 使用线程锁确保同一时间只有一个生成任务
+        with self._generation_lock:
+            return self._generate_internal(prompt, **kwargs)
+    
+    def _generate_internal(self, prompt: str, **kwargs) -> Dict[str, Any]:
+        """内部生成方法"""
         if not self.is_loaded:
             raise RuntimeError("模型未加载")
         
@@ -129,7 +124,7 @@ class FluxModel(BaseModel):
         
         # 使用模型加载时选择的GPU设备
         device = self.gpu_device
-        logger.debug(f"🎯 使用设备进行生成: {device}")
+        logger.debug(f"🎯 使用设备进行生成: {device} (实例: {self._instance_id})")
         
         start_time = time.time()
         
@@ -137,7 +132,13 @@ class FluxModel(BaseModel):
             # 设置随机种子 - 使用CPU generator如示例所示
             generator = torch.Generator("cpu").manual_seed(params['seed'])
             
-            logger.info(f"开始生成图片，提示词: {prompt}，设备: {device}")
+            logger.info(f"开始生成图片，提示词: {prompt}，设备: {device} (实例: {self._instance_id})")
+            
+            # 确保模型在正确的设备上
+            if device.startswith("cuda:"):
+                # 对于GPU设备，确保使用正确的CUDA设备
+                torch.cuda.set_device(device)
+                logger.debug(f"设置CUDA设备为: {device}")
             
             with torch.no_grad():
                 # 使用与工作示例相同的参数
@@ -174,7 +175,7 @@ class FluxModel(BaseModel):
                 except Exception as e:
                     logger.warning(f"保存图片失败: {e}")
             
-            logger.info(f"图片生成完成，耗时: {elapsed_time:.2f}秒，设备: {device}")
+            logger.info(f"图片生成完成，耗时: {elapsed_time:.2f}秒，设备: {device} (实例: {self._instance_id})")
             
             return {
                 "success": True,
@@ -183,19 +184,32 @@ class FluxModel(BaseModel):
                 "elapsed_time": elapsed_time,
                 "save_to_disk": save_to_disk,
                 "params": params,
-                "device": device
+                "device": device,
+                "instance_id": self._instance_id
             }
             
         except Exception as e:
-            logger.error(f"图片生成失败: {e}")
-            # 清理GPU内存
+            logger.error(f"图片生成失败: {e} (实例: {self._instance_id})")
+            # 清理GPU内存 - 增强版本
             if device.startswith("cuda"):
-                torch.cuda.empty_cache()
+                try:
+                    # 强制清理所有缓存
+                    torch.cuda.empty_cache()
+                    # 重置内存分配器
+                    torch.cuda.reset_peak_memory_stats()
+                    # 强制垃圾回收
+                    gc.collect()
+                    # 再次清理缓存
+                    torch.cuda.empty_cache()
+                    logger.debug(f"已彻底清理GPU显存 (实例: {self._instance_id})")
+                except Exception as cleanup_error:
+                    logger.warning(f"清理GPU显存时出错: {cleanup_error}")
             return {
                 "success": False,
                 "error": str(e),
                 "elapsed_time": time.time() - start_time,
-                "device": device
+                "device": device,
+                "instance_id": self._instance_id
             }
     
     def get_default_params(self) -> Dict[str, Any]:

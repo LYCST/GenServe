@@ -14,6 +14,9 @@ class Config:
     TORCH_DTYPE = os.getenv("TORCH_DTYPE", "bfloat16")  # Flux推荐使用bfloat16
     DEFAULT_GPU_DEVICE = os.getenv("DEFAULT_GPU_DEVICE", "0")
     
+    # PyTorch内存管理配置
+    PYTORCH_CUDA_ALLOC_CONF = os.getenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.6")
+    
     # 日志配置
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     

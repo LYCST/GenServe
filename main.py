@@ -8,6 +8,10 @@ from contextlib import asynccontextmanager
 from models.concurrent_manager import ConcurrentModelManager
 from device_manager import DeviceManager
 from config import Config
+import os
+
+# 设置PyTorch内存管理配置
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = Config.PYTORCH_CUDA_ALLOC_CONF
 
 # 配置日志
 logging.basicConfig(

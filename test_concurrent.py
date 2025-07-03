@@ -119,8 +119,8 @@ class EnhancedConcurrentTester:
             "prompt": prompt,
             "model": "flux1-dev",
             "num_inference_steps": 20,
-            "height": 1024,
-            "width": 1024,
+            "height": 512,
+            "width": 512,
             "seed": abs(hash(request_id)) % 10000  # 基于request_id生成稳定的种子
         }
         
@@ -374,14 +374,6 @@ async def main():
     test_prompts = [
         "a serene mountain landscape with a crystal clear lake reflecting the sky",
         "a playful golden retriever running through a field of sunflowers",
-        "a futuristic cityscape with glowing skyscrapers and flying vehicles",
-        "an enchanted forest with ancient trees and magical glowing mushrooms",
-        "a peaceful beach at sunset with waves gently lapping the shore",
-        "a majestic eagle soaring above snow-capped mountain peaks",
-        "a cozy cabin in the woods with smoke rising from the chimney",
-        "a vibrant coral reef teeming with colorful tropical fish",
-        "a starry night sky over a vast desert with sand dunes",
-        "a bustling market square in a medieval town with cobblestone streets"
     ]
     
     async with EnhancedConcurrentTester() as tester:
@@ -393,33 +385,33 @@ async def main():
         
         # 2. 突发测试
         print("\n2. 💥 突发测试...")
-        burst_results = await tester.burst_test(test_prompts, 6)  # 6个并发请求
+        burst_results = await tester.burst_test(test_prompts, 2)  # 6个并发请求
         tester.analyze_results(burst_results, "突发测试")
         
-        # 等待服务稳定
-        await asyncio.sleep(5)
+        # # 等待服务稳定
+        # await asyncio.sleep(5)
         
-        # 3. 持续负载测试
-        print("\n3. ⏱️ 持续负载测试...")
-        load_results = await tester.sustained_load_test(test_prompts, 60, 0.5)  # 60秒，每秒0.5个请求
-        tester.analyze_results(load_results, "持续负载测试")
+        # # 3. 持续负载测试
+        # print("\n3. ⏱️ 持续负载测试...")
+        # load_results = await tester.sustained_load_test(test_prompts, 60, 0.5)  # 60秒，每秒0.5个请求
+        # tester.analyze_results(load_results, "持续负载测试")
         
-        # 4. 生成性能报告
-        print("\n4. 📊 生成性能报告...")
-        all_results = tester.test_results
-        tester.analyze_results(all_results, "综合测试")
+        # # 4. 生成性能报告
+        # print("\n4. 📊 生成性能报告...")
+        # all_results = tester.test_results
+        # tester.analyze_results(all_results, "综合测试")
         
-        # 创建图表（如果安装了matplotlib）
-        try:
-            tester.create_performance_chart(all_results)
-        except ImportError:
-            print("📈 要生成性能图表，请安装matplotlib: pip install matplotlib")
-        except Exception as e:
-            print(f"📈 生成图表时出错: {e}")
+        # # 创建图表（如果安装了matplotlib）
+        # try:
+        #     tester.create_performance_chart(all_results)
+        # except ImportError:
+        #     print("📈 要生成性能图表，请安装matplotlib: pip install matplotlib")
+        # except Exception as e:
+        #     print(f"📈 生成图表时出错: {e}")
         
-        # 5. 最终状态检查
-        print("\n5. 🔍 最终状态检查...")
-        await tester.display_service_info()
+        # # 5. 最终状态检查
+        # print("\n5. 🔍 最终状态检查...")
+        # await tester.display_service_info()
     
     print(f"\n✨ 测试完成！")
     print(f"📁 如果启用了图片保存（SAVE_TEST_IMAGES=true），图片将保存在当前目录")

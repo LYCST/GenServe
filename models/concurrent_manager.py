@@ -1,6 +1,8 @@
 import asyncio
 import threading
 import time
+import os
+import subprocess
 from typing import Dict, List, Optional, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -48,6 +50,7 @@ class ModelInstance:
         # 从配置获取队列大小限制
         config = Config.get_config()
         self.max_queue_size = config["concurrent"]["max_gpu_queue_size"]
+        
     
     def is_available(self) -> bool:
         """检查实例是否可用"""
@@ -58,7 +61,7 @@ class ModelInstance:
         """检查是否可以接受新任务（考虑队列大小）"""
         return self.task_queue.qsize() < self.max_queue_size
     
-    def set_busy(self, busy: bool, task_id: str = None):
+    def set_busy(self, busy: bool, task_id: Optional[str] = None):
         """设置忙碌状态"""
         with self.lock:
             self.is_busy = busy
@@ -79,11 +82,12 @@ class ModelInstance:
                 "queue_size": self.task_queue.qsize(),
                 "max_queue_size": self.max_queue_size,
                 "total_generations": self.total_generations,
-                "last_used": self.last_used
+                "last_used": self.last_used,
+                "cuda_visible_devices": self.device.split(":")[1]
             }
 
 class ConcurrentModelManager:
-    """改进的并发模型管理器"""
+    """改进的并发模型管理器 - 支持GPU环境隔离"""
     
     def __init__(self):
         self.device_manager = DeviceManager()
@@ -117,6 +121,61 @@ class ConcurrentModelManager:
         self._initialize_models()
         self._start_manager()
     
+    def _create_model_with_gpu_isolation(self, model_id: str, gpu_device: str, instance_id: str) -> Optional[BaseModel]:
+        """创建具有GPU隔离的模型实例"""
+        try:
+            # 设置当前进程的CUDA_VISIBLE_DEVICES
+            if gpu_device.startswith("cuda:"):
+                gpu_id = gpu_device.split(":")[1]
+                old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+                logger.info(f"为实例 {instance_id} 设置 CUDA_VISIBLE_DEVICES={gpu_id}")
+                
+                try:
+                    # 创建模型实例
+                    if model_id == "flux1-dev":
+                        # 对于GPU隔离，传入cuda:0（因为只有一个可见GPU）
+                        model = FluxModel(gpu_device="cuda:0")
+                    else:
+                        logger.warning(f"未知模型类型: {model_id}")
+                        return None
+                    
+                    # 加载模型
+                    if model.load():
+                        logger.info(f"✅ GPU隔离模型实例 {instance_id} 创建成功， cuda_visible_devices: {gpu_id}")
+                        return model
+                    else:
+                        logger.error(f"❌ GPU隔离模型实例 {model_id} 加载失败")
+                        return None
+                        
+                finally:
+                    # 恢复原始的CUDA_VISIBLE_DEVICES
+                    if old_cuda_visible:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
+                    else:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                        
+            else:
+                # CPU模式
+                if model_id == "flux1-dev":
+                    model = FluxModel(gpu_device="cpu")
+                else:
+                    logger.warning(f"未知模型类型: {model_id}")
+                    return None
+                
+                if model.load():
+                    logger.info(f"✅ CPU模型实例 {instance_id} 创建成功")
+                    return model
+                else:
+                    logger.error(f"❌ CPU模型实例 {model_id} 加载失败")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"❌ 创建GPU隔离模型实例失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+    
     def _initialize_models(self):
         """初始化模型实例"""
         model_gpu_config = Config.get_config()["model_management"]["model_gpu_config"]
@@ -125,30 +184,40 @@ class ConcurrentModelManager:
             if model_id not in self.model_instances:
                 self.model_instances[model_id] = []
             
-            # 为每个GPU创建一个模型实例
-            for i, gpu_device in enumerate(gpu_list):
+            # 为每个GPU创建一个模型实例（每个GPU只创建一个）
+            for gpu_device in gpu_list:
                 if self.device_manager.validate_device(gpu_device):
                     try:
-                        # 创建模型实例
-                        if model_id == "flux1-dev":
-                            model = FluxModel(gpu_device=gpu_device)
-                        else:
-                            logger.warning(f"未知模型类型: {model_id}")
+                        # 生成唯一实例ID
+                        instance_id = f"{model_id}_{gpu_device.replace(':', '_')}"
+                        
+                        # 检查是否已经存在这个实例
+                        if instance_id in self.instance_lookup:
+                            logger.warning(f"实例 {instance_id} 已存在，跳过创建")
                             continue
                         
-                        # 生成唯一实例ID
-                        instance_id = f"{model_id}_{gpu_device.replace(':', '_')}_{i}"
+                        # 创建模型实例
+                        model = self._create_model_with_gpu_isolation(model_id, gpu_device, instance_id)
                         
-                        # 加载模型
-                        if model.load():
+                        if model:
                             instance = ModelInstance(model, gpu_device, instance_id)
                             self.model_instances[model_id].append(instance)
                             self.instance_lookup[instance_id] = instance
-                            logger.info(f"模型实例 {instance_id} 创建成功")
+                            logger.info(f"✅ 模型实例 {instance_id} 创建成功")
                         else:
-                            logger.error(f"模型实例 {model_id} 在 {gpu_device} 上加载失败")
+                            logger.error(f"❌ 模型实例 {model_id} 在 {gpu_device} 上加载失败")
                     except Exception as e:
-                        logger.error(f"创建模型实例失败: {e}")
+                        logger.error(f"❌ 创建模型实例失败: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+        
+        # 打印初始化结果
+        total_instances = sum(len(instances) for instances in self.model_instances.values())
+        logger.info(f"🎉 模型初始化完成，总共创建了 {total_instances} 个实例")
+        for model_id, instances in self.model_instances.items():
+            logger.info(f"  {model_id}: {len(instances)} 个实例")
+            for inst in instances:
+                logger.info(f"    - {inst.instance_id} ({inst.device})")
     
     def _start_manager(self):
         """启动管理器"""
@@ -189,9 +258,12 @@ class ConcurrentModelManager:
                 best_instance = self._find_best_instance(task.model_id)
                 
                 if best_instance:
+                    # 立即标记GPU为忙碌状态，防止重复分配
+                    best_instance.set_busy(True, task.task_id)
+                    
                     # 分配任务给GPU
                     best_instance.task_queue.put(task)
-                    logger.info(f"任务 {task.task_id} 已分配给 {best_instance.instance_id}")
+                    logger.info(f"任务 {task.task_id} 已分配给 {best_instance.instance_id} (设备: {best_instance.device})")
                 else:
                     # 所有GPU都忙碌或队列已满，重新放回队列
                     self.global_task_queue.put(task)
@@ -214,24 +286,16 @@ class ConcurrentModelManager:
         # 过滤可接受任务的实例
         available_instances = [
             inst for inst in instances 
-            if inst.model.is_loaded and inst.can_accept_task()
+            if inst.model.is_loaded and inst.can_accept_task() and not inst.is_busy
         ]
         
         if not available_instances:
             logger.debug(f"⚠️ 模型 {model_id} 没有可用实例")
             return None
         
-        # 优先选择空闲的实例
-        idle_instances = [inst for inst in available_instances if not inst.is_busy]
-        if idle_instances:
-            # 在空闲实例中选择队列最短的
-            best = min(idle_instances, key=lambda x: x.task_queue.qsize())
-            logger.debug(f"✅ 选择空闲实例 {best.instance_id}，队列大小: {best.task_queue.qsize()}")
-            return best
-        
-        # 如果都在忙碌，选择队列最短的
+        # 选择队列最短的空闲实例
         best = min(available_instances, key=lambda x: x.task_queue.qsize())
-        logger.debug(f"✅ 选择忙碌实例 {best.instance_id}，队列大小: {best.task_queue.qsize()}")
+        logger.debug(f"✅ 选择空闲实例 {best.instance_id}，队列大小: {best.task_queue.qsize()}")
         return best
     
     def _gpu_worker_loop(self, instance: ModelInstance):
@@ -251,32 +315,55 @@ class ConcurrentModelManager:
             except Exception as e:
                 logger.error(f"GPU工作线程 {instance.instance_id} 错误: {e}")
     
-    def _process_task_on_gpu(self, task: GenerationTask, instance: ModelInstance):
-        """在指定GPU上处理任务"""
-        logger.info(f"🚀 开始处理任务 {task.task_id[:8]} 在 {instance.device}")
-        
-        # 标记GPU为忙碌
-        instance.set_busy(True, task.task_id)
+    def _check_and_cleanup_memory(self, instance: ModelInstance):
+        """检查并清理内存"""
+        if not instance.device.startswith("cuda:"):
+            return
         
         try:
-            # 设置CUDA设备
-            if instance.device.startswith("cuda:"):
-                gpu_id = int(instance.device.split(":")[1])
-                torch.cuda.set_device(gpu_id)
+            gpu_id = int(instance.device.split(":")[1])
+            allocated = torch.cuda.memory_allocated(gpu_id)
+            total = torch.cuda.get_device_properties(gpu_id).total_memory
+            usage_ratio = allocated / total
+            
+            # 如果内存使用率超过80%，强制清理
+            if usage_ratio > 0.8:
+                logger.warning(f"GPU {gpu_id} 内存使用率过高 ({usage_ratio:.1%})，强制清理")
                 torch.cuda.empty_cache()
-                logger.debug(f"🎯 CUDA设备已设置为: cuda:{gpu_id}")
+                torch.cuda.reset_peak_memory_stats()
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logger.warning(f"检查内存时出错: {e}")
+    
+    def _process_task_on_gpu(self, task: GenerationTask, instance: ModelInstance):
+        """在指定GPU上处理任务 - 使用GPU环境隔离"""
+        logger.info(f"🚀 开始处理任务 {task.task_id[:8]} 在 {instance.device}")
+        
+        # 注意：忙碌状态已经在全局调度器中设置，这里不需要重复设置
+
+        # 设置GPU环境变量
+        old_cuda_visible = None
+        if instance.device.startswith("cuda:"):
+            gpu_id = instance.device.split(":")[1]
+            old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+            logger.debug(f"为任务 {task.task_id[:8]} 设置 CUDA_VISIBLE_DEVICES={gpu_id}")
             
-            # 确保模型在正确设备上
-            if hasattr(instance.model, 'gpu_device'):
-                instance.model.gpu_device = instance.device
-            
-            # 执行生成
+            # 任务开始前检查并清理内存
+            self._check_and_cleanup_memory(instance)
+
+        try:
+            # 执行生成 - 在GPU隔离环境中
             result = instance.model.generate(task.prompt, **task.params)
             result.update({
                 "task_id": task.task_id,
                 "device": instance.device,
                 "instance_id": instance.instance_id,
-                "queue_wait_time": time.time() - task.created_at
+                "queue_wait_time": time.time() - task.created_at,
+                "cuda_visible_devices": instance.device.split(":")[1] if instance.device.startswith("cuda:") else "cpu"
             })
             
             # 返回结果
@@ -292,12 +379,27 @@ class ConcurrentModelManager:
             import traceback
             logger.error(traceback.format_exc())
             
+            # 立即清理GPU显存
+            try:
+                if instance.device.startswith("cuda:"):
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+                    # 强制垃圾回收
+                    import gc
+                    gc.collect()
+                    # 再次清理缓存
+                    torch.cuda.empty_cache()
+                    logger.debug(f"已彻底清理GPU显存 (任务失败)")
+            except Exception as cleanup_error:
+                logger.warning(f"清理GPU显存时出错: {cleanup_error}")
+            
             result = {
                 "success": False,
                 "error": str(e),
                 "task_id": task.task_id,
                 "device": instance.device,
-                "instance_id": instance.instance_id
+                "instance_id": instance.instance_id,
+                "cuda_visible_devices": instance.device.split(":")[1] if instance.device.startswith("cuda:") else "cpu"
             }
             task.result_queue.put(result)
             
@@ -305,12 +407,32 @@ class ConcurrentModelManager:
             self.stats["failed_tasks"] += 1
             
         finally:
+            # 恢复GPU环境变量
+            if old_cuda_visible is not None:
+                if old_cuda_visible:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
+                else:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                logger.debug(f"恢复 CUDA_VISIBLE_DEVICES={old_cuda_visible}")
+            
             # 释放GPU
             instance.set_busy(False)
             
-            # 清理GPU缓存
-            if instance.device.startswith("cuda:"):
-                torch.cuda.empty_cache()
+            # 轻量级GPU缓存清理
+            try:
+                if instance.device.startswith("cuda:"):
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+                    # 强制垃圾回收
+                    import gc
+                    gc.collect()
+                    # 再次清理缓存
+                    torch.cuda.empty_cache()
+                    logger.debug(f"已彻底清理GPU显存 (任务完成)")
+            except Exception as e:
+                logger.warning(f"清理GPU缓存时出错: {e}")
+            
+            self._check_and_cleanup_memory(instance)
     
     async def generate_image_async(self, model_id: str, prompt: str, priority: int = 0, **kwargs) -> Dict[str, Any]:
         """异步生成图片 - 支持优先级"""
