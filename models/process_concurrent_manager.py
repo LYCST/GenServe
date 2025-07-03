@@ -221,7 +221,12 @@ class ProcessConcurrentModelManager:
                 "width": task.params.get('width', 1024),
                 "cfg": task.params.get('cfg', 3.5),
                 "num_inference_steps": task.params.get('num_inference_steps', 50),
-                "seed": task.params.get('seed', 42)
+                "seed": task.params.get('seed', 42),
+                "mode": task.params.get('mode', 'text2img'),
+                "strength": task.params.get('strength', 0.8),
+                "input_image": task.params.get('input_image'),
+                "mask_image": task.params.get('mask_image'),
+                "control_image": task.params.get('control_image')
             }
             
             # 提交任务到GPU进程
@@ -273,65 +278,116 @@ class ProcessConcurrentModelManager:
             task.result_queue.put(error_result)
             self.stats["failed_tasks"] += 1
     
-    async def generate_image_async(self, model_id: str, prompt: str, priority: int = 0, **kwargs) -> Dict[str, Any]:
-        """异步生成图片 - 支持优先级"""
-        task_id = str(uuid.uuid4())
-        
-        # 检查是否有可用GPU进程
-        if model_id not in self.model_instances or not self.model_instances[model_id]:
+    async def generate_image_async(
+        self, 
+        model_id: str, 
+        prompt: str, 
+        priority: int = 0,
+        height: int = 1024,
+        width: int = 1024,
+        num_inference_steps: int = 50,
+        cfg: float = 3.5,
+        seed: int = 42,
+        mode: str = "text2img",
+        strength: float = 0.8,
+        input_image: Optional[str] = None,
+        mask_image: Optional[str] = None,
+        control_image: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """异步生成图片 - 支持图生图"""
+        if not self.is_running:
             return {
                 "success": False,
-                "error": f"模型 {model_id} 不可用",
-                "task_id": task_id
+                "error": "并发管理器未运行",
+                "task_id": "",
+                "gpu_id": None,
+                "model_id": model_id
             }
         
-        # 检查全局队列是否过载
-        if self.global_task_queue.qsize() >= self.max_global_queue_size:
-            self.stats["queue_full_rejections"] += 1
+        # 验证模型是否支持
+        if model_id not in self.model_instances:
             return {
                 "success": False,
-                "error": "服务器过载，请稍后重试",
-                "task_id": task_id
+                "error": f"模型 {model_id} 未加载",
+                "task_id": "",
+                "gpu_id": None,
+                "model_id": model_id
             }
-        
-        # 创建结果队列
-        result_queue = Queue()
-        self.task_results[task_id] = result_queue
         
         # 创建任务
+        task_id = str(uuid.uuid4())
+        result_queue = Queue()
+        
+        # 构建任务参数
+        task_params = {
+            "height": height,
+            "width": width,
+            "num_inference_steps": num_inference_steps,
+            "cfg": cfg,
+            "seed": seed,
+            "mode": mode,
+            "strength": strength,
+            "input_image": input_image,
+            "mask_image": mask_image,
+            "control_image": control_image
+        }
+        
         task = GenerationTask(
             task_id=task_id,
             model_id=model_id,
             prompt=prompt,
-            params=kwargs,
+            params=task_params,
             result_queue=result_queue,
             created_at=time.time(),
             priority=priority
         )
         
-        # 添加到全局任务队列
-        self.global_task_queue.put(task)
-        self.stats["total_tasks"] += 1
+        logger.info(f"提交{mode}任务: {task_id}, 模型: {model_id}, 优先级: {priority}")
         
-        logger.info(f"任务 {task_id} 已加入队列，优先级: {priority}")
-        
+        # 提交到全局队列
         try:
-            # 等待结果（使用配置的超时时间）
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, result_queue.get, True, self.task_timeout
-            )
-            return result
-            
+            self.global_task_queue.put(task)
+            logger.info(f"任务 {task_id} 已提交到全局队列")
         except Exception as e:
-            logger.error(f"等待任务 {task_id} 结果时发生错误: {e}")
+            logger.error(f"提交任务 {task_id} 失败: {e}")
             return {
                 "success": False,
-                "error": f"任务超时或发生错误: {str(e)}",
-                "task_id": task_id
+                "error": f"提交任务失败: {str(e)}",
+                "task_id": task_id,
+                "gpu_id": None,
+                "model_id": model_id
             }
-        finally:
-            # 清理结果队列
-            self.task_results.pop(task_id, None)
+        
+        # 等待结果
+        try:
+            result = result_queue.get(timeout=Config.TASK_TIMEOUT)
+            logger.info(f"任务 {task_id} 完成: {result.get('success', False)}")
+            
+            # 添加任务ID到结果
+            result["task_id"] = task_id
+            result["model_id"] = model_id
+            result["mode"] = mode
+            
+            return result
+            
+        except Empty:
+            logger.error(f"任务 {task_id} 超时")
+            return {
+                "success": False,
+                "error": f"任务超时 ({Config.TASK_TIMEOUT}秒)",
+                "task_id": task_id,
+                "gpu_id": None,
+                "model_id": model_id
+            }
+        except Exception as e:
+            logger.error(f"等待任务 {task_id} 结果时出错: {e}")
+            return {
+                "success": False,
+                "error": f"等待结果失败: {str(e)}",
+                "task_id": task_id,
+                "gpu_id": None,
+                "model_id": model_id
+            }
     
     def get_status(self) -> Dict[str, Any]:
         """获取详细状态"""

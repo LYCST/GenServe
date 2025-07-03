@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, result_queue):
     """GPU工作进程 - 在隔离环境中运行（顶层函数，支持spawn）"""
     import torch
-    from diffusers import FluxPipeline
+    from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxFillPipeline, FluxControlPipeline
     import base64
     import io
     from PIL import Image
@@ -28,9 +28,32 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
     import time
     import gc
     import psutil
+    import os
 
     logger = logging.getLogger(f"gpu_worker_{gpu_id}")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+    
+    def load_image_from_base64(image_data: str):
+        """从base64加载图片"""
+        if not image_data:
+            raise ValueError("图片数据为空")
+        
+        try:
+            # 处理data URL格式
+            if image_data.startswith('data:image'):
+                image_data = image_data.split(',')[1]
+            
+            # 解码base64
+            image_bytes = base64.b64decode(image_data)
+            image = Image.open(io.BytesIO(image_bytes))
+            
+            # 转换为RGB模式
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            
+            return image
+        except Exception as e:
+            raise ValueError(f"加载图片失败: {str(e)}")
     
     # 设置进程优先级和内存限制
     try:
@@ -49,14 +72,23 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         
-        pipe = FluxPipeline.from_pretrained(
+        # 初始化pipeline字典
+        pipelines = {
+            "text2img": None,
+            "img2img": None,
+            "fill": None,
+            "controlnet": None
+        }
+        
+        # 加载基础text2img pipeline
+        pipelines["text2img"] = FluxPipeline.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             use_safetensors=True,
             local_files_only=True
         )
-        pipe.enable_model_cpu_offload(device="cuda:0")
-        logger.info(f"✅ 模型已加载到GPU {gpu_id}")
+        pipelines["text2img"].enable_model_cpu_offload(device="cuda:0")
+        logger.info(f"✅ 基础模型已加载到GPU {gpu_id}")
         
         task_count = 0
         consecutive_failures = 0  # 连续失败计数
@@ -100,7 +132,7 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
                         gc.collect()
                 
                 # 处理任务
-                result = process_generation_task(pipe, task, gpu_id)
+                result = process_generation_task(pipelines, task, gpu_id, load_image_from_base64, model_path)
                 result_queue.put(result)
                 
                 success = result.get('success', False)
@@ -195,7 +227,10 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
                     gc.collect()
         
         logger.info(f"GPU {gpu_id} 开始最终清理资源...")
-        del pipe
+        # 清理所有pipeline
+        for pipeline in pipelines.values():
+            if pipeline is not None:
+                del pipeline
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -214,12 +249,15 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
         except Exception as put_error:
             logger.error(f"GPU {gpu_id} 无法返回启动失败结果: {put_error}")
 
-def process_generation_task(pipe, task, gpu_id: str):
+def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model_path: str):
     import torch
     import io
     import base64
     import time
     import traceback
+    from PIL import Image
+    import os
+    from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxFillPipeline, FluxControlPipeline
     logger = logging.getLogger(f"gpu_worker_{gpu_id}")
     start_time = time.time()
     
@@ -233,16 +271,118 @@ def process_generation_task(pipe, task, gpu_id: str):
         logger.info(f"GPU {gpu_id} 开始生成任务: {task.get('task_id', 'unknown')}")
         generator = torch.Generator("cpu").manual_seed(task.get('seed', 42))
         
+        # 获取生成模式
+        mode = task.get('mode', 'text2img')
+        logger.info(f"GPU {gpu_id} 使用模式: {mode}")
+        
+        # 根据模式选择或加载pipeline
+        if mode == 'text2img':
+            pipe = pipelines["text2img"]
+        elif mode == 'img2img':
+            if pipelines["img2img"] is None:
+                logger.info(f"GPU {gpu_id} 加载img2img pipeline...")
+                pipelines["img2img"] = FluxImg2ImgPipeline.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    use_safetensors=True,
+                    local_files_only=True
+                )
+                pipelines["img2img"].enable_model_cpu_offload(device="cuda:0")
+                logger.info(f"GPU {gpu_id} img2img pipeline加载完成")
+            pipe = pipelines["img2img"]
+        elif mode == 'fill':
+            if pipelines["fill"] is None:
+                logger.info(f"GPU {gpu_id} 加载fill pipeline...")
+                pipelines["fill"] = FluxFillPipeline.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    use_safetensors=True,
+                    local_files_only=True
+                )
+                pipelines["fill"].enable_model_cpu_offload(device="cuda:0")
+                logger.info(f"GPU {gpu_id} fill pipeline加载完成")
+            pipe = pipelines["fill"]
+        elif mode == 'controlnet':
+            if pipelines["controlnet"] is None:
+                logger.info(f"GPU {gpu_id} 加载controlnet pipeline...")
+                # 使用专门的controlnet模型路径
+                controlnet_model_path = os.path.join(os.path.dirname(model_path), "flux1-depth-dev")
+                if not os.path.exists(controlnet_model_path):
+                    # 如果专用路径不存在，使用基础路径
+                    controlnet_model_path = model_path
+                    logger.warning(f"GPU {gpu_id} 专用controlnet模型路径不存在，使用基础模型: {controlnet_model_path}")
+                
+                try:
+                    pipelines["controlnet"] = FluxControlPipeline.from_pretrained(
+                        controlnet_model_path,
+                        torch_dtype=torch.bfloat16,
+                        use_safetensors=True,
+                        local_files_only=True
+                    )
+                    pipelines["controlnet"].enable_model_cpu_offload(device="cuda:0")
+                    logger.info(f"GPU {gpu_id} controlnet pipeline加载完成")
+                except Exception as e:
+                    logger.error(f"GPU {gpu_id} 加载controlnet pipeline失败: {e}")
+                    # 如果controlnet加载失败，回退到基础pipeline
+                    logger.info(f"GPU {gpu_id} 回退到基础pipeline")
+                    pipelines["controlnet"] = pipelines["text2img"]
+            pipe = pipelines["controlnet"]
+        else:
+            raise ValueError(f"不支持的生成模式: {mode}")
+        
         with torch.no_grad():
-            result = pipe(
-                prompt=task['prompt'],
-                height=task.get('height', 1024),
-                width=task.get('width', 1024),
-                guidance_scale=task.get('cfg', 3.5),
-                num_inference_steps=task.get('num_inference_steps', 50),
-                max_sequence_length=512,
-                generator=generator
-            )
+            if mode == 'text2img':
+                result = pipe(
+                    prompt=task['prompt'],
+                    height=task.get('height', 1024),
+                    width=task.get('width', 1024),
+                    guidance_scale=task.get('cfg', 3.5),
+                    num_inference_steps=task.get('num_inference_steps', 50),
+                    max_sequence_length=512,
+                    generator=generator
+                )
+            elif mode == 'img2img':
+                # 加载输入图片
+                input_image = load_image_func(task.get('input_image'))
+                result = pipe(
+                    prompt=task['prompt'],
+                    image=input_image,
+                    strength=task.get('strength', 0.8),
+                    guidance_scale=task.get('cfg', 3.5),
+                    num_inference_steps=task.get('num_inference_steps', 50),
+                    max_sequence_length=512,
+                    generator=generator
+                )
+            elif mode == 'fill':
+                # 加载输入图片和蒙版
+                input_image = load_image_func(task.get('input_image'))
+                mask_image = load_image_func(task.get('mask_image'))
+                result = pipe(
+                    prompt=task['prompt'],
+                    image=input_image,
+                    mask_image=mask_image,
+                    height=task.get('height', 1024),
+                    width=task.get('width', 1024),
+                    guidance_scale=task.get('cfg', 3.5),
+                    num_inference_steps=task.get('num_inference_steps', 50),
+                    max_sequence_length=512,
+                    generator=generator
+                )
+            elif mode == 'controlnet':
+                # 加载控制图片
+                control_image = load_image_func(task.get('control_image'))
+                result = pipe(
+                    prompt=task['prompt'],
+                    control_image=control_image,
+                    height=task.get('height', 1024),
+                    width=task.get('width', 1024),
+                    guidance_scale=task.get('cfg', 3.5),
+                    num_inference_steps=task.get('num_inference_steps', 50),
+                    max_sequence_length=512,
+                    generator=generator
+                )
+            else:
+                raise ValueError(f"不支持的生成模式: {mode}")
         
         image = result.images[0]
         buffer = io.BytesIO()
@@ -257,7 +397,7 @@ def process_generation_task(pipe, task, gpu_id: str):
             memory_increase = final_allocated - initial_allocated
             logger.info(f"GPU {gpu_id} 任务完成后内存: 已分配 {final_allocated:.1f}MB (+{memory_increase:.1f}MB), 缓存 {final_cached:.1f}MB")
         
-        logger.info(f"GPU {gpu_id} 生成成功，耗时: {elapsed_time:.2f}秒")
+        logger.info(f"GPU {gpu_id} {mode}生成成功，耗时: {elapsed_time:.2f}秒")
         
         # 处理保存到磁盘
         save_to_disk = False
@@ -277,11 +417,12 @@ def process_generation_task(pipe, task, gpu_id: str):
             "gpu_id": gpu_id,
             "task_id": task.get('task_id'),
             "save_to_disk": save_to_disk,
-            "params": task
+            "params": task,
+            "mode": mode
         }
     except Exception as e:
         elapsed_time = time.time() - start_time
-        error_msg = f"GPU {gpu_id} 生成失败: {str(e)}"
+        error_msg = f"GPU {gpu_id} {mode}生成失败: {str(e)}"
         logger.error(error_msg)
         logger.error(f"生成错误详情: {traceback.format_exc()}")
         
@@ -296,7 +437,8 @@ def process_generation_task(pipe, task, gpu_id: str):
             "error": str(e),
             "elapsed_time": elapsed_time,
             "gpu_id": gpu_id,
-            "task_id": task.get('task_id')
+            "task_id": task.get('task_id'),
+            "mode": mode
         }
 
 class GPUIsolationManager:

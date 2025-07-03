@@ -12,4 +12,4 @@ pydantic
 matplotlib
 numpy
 psutil
-
+git+https://github.com/asomoza/image_gen_aux.git
