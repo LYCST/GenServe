@@ -122,56 +122,27 @@ class ConcurrentModelManager:
         self._start_manager()
     
     def _create_model_with_gpu_isolation(self, model_id: str, gpu_device: str, instance_id: str) -> Optional[BaseModel]:
-        """创建具有GPU隔离的模型实例"""
+        """创建具有GPU隔离的模型实例 - 修复版本"""
         try:
-            # 设置当前进程的CUDA_VISIBLE_DEVICES
-            if gpu_device.startswith("cuda:"):
-                gpu_id = gpu_device.split(":")[1]
-                old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-                logger.info(f"为实例 {instance_id} 设置 CUDA_VISIBLE_DEVICES={gpu_id}")
-                
-                try:
-                    # 创建模型实例
-                    if model_id == "flux1-dev":
-                        # 对于GPU隔离，传入cuda:0（因为只有一个可见GPU）
-                        model = FluxModel(gpu_device="cuda:0")
-                    else:
-                        logger.warning(f"未知模型类型: {model_id}")
-                        return None
-                    
-                    # 加载模型
-                    if model.load():
-                        logger.info(f"✅ GPU隔离模型实例 {instance_id} 创建成功， cuda_visible_devices: {gpu_id}")
-                        return model
-                    else:
-                        logger.error(f"❌ GPU隔离模型实例 {model_id} 加载失败")
-                        return None
-                        
-                finally:
-                    # 恢复原始的CUDA_VISIBLE_DEVICES
-                    if old_cuda_visible:
-                        os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
-                    else:
-                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-                        
+            # 创建模型实例
+            if model_id == "flux1-dev":
+                # 传递原始设备名，不在这里设置CUDA_VISIBLE_DEVICES
+                model = FluxModel(gpu_device=gpu_device)
             else:
-                # CPU模式
-                if model_id == "flux1-dev":
-                    model = FluxModel(gpu_device="cpu")
-                else:
-                    logger.warning(f"未知模型类型: {model_id}")
-                    return None
-                
-                if model.load():
-                    logger.info(f"✅ CPU模型实例 {instance_id} 创建成功")
-                    return model
-                else:
-                    logger.error(f"❌ CPU模型实例 {model_id} 加载失败")
-                    return None
+                logger.warning(f"未知模型类型: {model_id}")
+                return None
+            
+            # 加载模型
+            logger.info(f"开始加载模型 {model_id} (实例: {instance_id})")
+            if model.load():
+                logger.info(f"✅ 模型实例 {instance_id} 创建成功，目标设备: {gpu_device}")
+                return model
+            else:
+                logger.error(f"❌ 模型实例 {model_id} 加载失败")
+                return None
                     
         except Exception as e:
-            logger.error(f"❌ 创建GPU隔离模型实例失败: {e}")
+            logger.error(f"❌ 创建模型实例失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return None
@@ -316,94 +287,101 @@ class ConcurrentModelManager:
                 logger.error(f"GPU工作线程 {instance.instance_id} 错误: {e}")
     
     def _check_and_cleanup_memory(self, instance: ModelInstance, force_cleanup: bool = False):
-        """检查并清理内存 - 增强版本"""
+        """检查并清理内存 - GPU隔离版本"""
         if not instance.device.startswith("cuda:"):
             return
         
         try:
-            gpu_id = int(instance.device.split(":")[1])
+            gpu_id = instance.device.split(":")[1]
+            old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
             
-            # 确保在正确的GPU上下文中操作
-            with torch.cuda.device(gpu_id):
-                allocated = torch.cuda.memory_allocated(gpu_id)
-                total = torch.cuda.get_device_properties(gpu_id).total_memory
-                usage_ratio = allocated / total
-                
-                logger.debug(f"GPU {gpu_id} 内存使用率: {usage_ratio:.1%}")
-                
-                # 如果内存使用率超过95%或者强制清理，执行深度清理
-                if usage_ratio > 0.95 or force_cleanup:
-                    logger.warning(f"GPU {gpu_id} 内存使用率过高 ({usage_ratio:.1%})，执行深度清理")
-                    
-                    # 先尝试卸载并重新加载模型
-                    if hasattr(instance.model, '_emergency_cleanup'):
-                        instance.model._emergency_cleanup()
-                    else:
-                        # 备用清理方法
-                        torch.cuda.empty_cache()
-                        torch.cuda.reset_peak_memory_stats()
-                        import gc
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                    
-                    # 检查清理效果
-                    new_allocated = torch.cuda.memory_allocated(gpu_id)
-                    new_usage_ratio = new_allocated / total
-                    logger.info(f"GPU {gpu_id} 清理后内存使用率: {new_usage_ratio:.1%}")
-                    
-                    # 如果清理效果不好，重新加载模型
-                    if new_usage_ratio > 0.6 and hasattr(instance.model, 'unload') and hasattr(instance.model, 'load'):
-                        logger.warning(f"GPU {gpu_id} 清理效果不佳，尝试重新加载模型")
-                        instance.model.unload()
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                        gc.collect()
-                        time.sleep(1)  # 给系统一点时间
-                        success = instance.model.load()
-                        if not success:
-                            logger.error(f"重新加载模型失败")
-                        else:
-                            final_allocated = torch.cuda.memory_allocated(gpu_id)
-                            final_usage_ratio = final_allocated / total
-                            logger.info(f"GPU {gpu_id} 重新加载后内存使用率: {final_usage_ratio:.1%}")
+            # 设置GPU隔离环境
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+            
+            try:
+                if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                    # 在GPU隔离环境中，总是使用设备0
+                    with torch.cuda.device(0):
+                        allocated = torch.cuda.memory_allocated(0)
+                        total = torch.cuda.get_device_properties(0).total_memory
+                        usage_ratio = allocated / total
+                        
+                        logger.debug(f"GPU {gpu_id} (隔离环境) 内存使用率: {usage_ratio:.1%}")
+                        
+                        # 如果内存使用率超过95%或者强制清理，执行深度清理
+                        if usage_ratio > 0.95 or force_cleanup:
+                            logger.warning(f"GPU {gpu_id} 内存使用率过高 ({usage_ratio:.1%})，执行深度清理")
+                            
+                            # 先尝试模型的紧急清理
+                            if hasattr(instance.model, '_emergency_cleanup'):
+                                instance.model._emergency_cleanup()
+                            else:
+                                # 备用清理方法
+                                torch.cuda.empty_cache()
+                                torch.cuda.reset_peak_memory_stats()
+                                import gc
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                            
+                            # 检查清理效果
+                            new_allocated = torch.cuda.memory_allocated(0)
+                            new_usage_ratio = new_allocated / total
+                            logger.info(f"GPU {gpu_id} 清理后内存使用率: {new_usage_ratio:.1%}")
+                            
+            finally:
+                # 恢复环境变量
+                if old_cuda_visible:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
+                else:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
                 
         except Exception as e:
             logger.warning(f"检查内存时出错: {e}")
     
     def _process_task_on_gpu(self, task: GenerationTask, instance: ModelInstance):
-        """在指定GPU上处理任务 - 增强版本"""
-        logger.info(f"🚀 开始处理任务 {task.task_id[:8]} 在 {instance.device}")
+        """在GPU上处理任务 - 动态GPU隔离版本"""
+        logger.info(f"开始处理任务 {task.task_id[:8]} (实例: {instance.instance_id})")
         
-        # 设置GPU环境变量
+        # 设置GPU隔离环境变量
         old_cuda_visible = None
+        gpu_id = None
+        
         if instance.device.startswith("cuda:"):
             gpu_id = instance.device.split(":")[1]
             old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-            logger.debug(f"为任务 {task.task_id[:8]} 设置 CUDA_VISIBLE_DEVICES={gpu_id}")
-            
-            # 任务开始前检查并清理内存
-            self._check_and_cleanup_memory(instance)
-
+            if gpu_id is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+                logger.debug(f"设置GPU隔离环境: CUDA_VISIBLE_DEVICES={gpu_id}")
+        
         try:
-            # 执行生成 - 在GPU隔离环境中
+            # 更新模型设备配置
+            if hasattr(instance.model, '_update_device_for_task'):
+                instance.model._update_device_for_task(instance.device)
+            
+            # 执行生成任务
             result = instance.model.generate(task.prompt, **task.params)
+            
+            # 添加任务信息
             result.update({
                 "task_id": task.task_id,
                 "device": instance.device,
                 "instance_id": instance.instance_id,
-                "queue_wait_time": time.time() - task.created_at,
-                "cuda_visible_devices": instance.device.split(":")[1] if instance.device.startswith("cuda:") else "cpu"
+                "cuda_visible_devices": gpu_id if instance.device.startswith("cuda:") else "cpu",
+                "physical_gpu": gpu_id if instance.device.startswith("cuda:") else "cpu"
             })
             
-            # 返回结果
+            # 发送结果
             task.result_queue.put(result)
             
             # 更新统计
-            self.stats["completed_tasks"] += 1
-            
-            logger.info(f"✅ 任务 {task.task_id[:8]} 完成，设备: {instance.device}，耗时: {result.get('elapsed_time', 0):.2f}秒")
+            if result.get("success", False):
+                self.stats["completed_tasks"] += 1
+                instance.total_generations += 1
+                logger.info(f"✅ 任务 {task.task_id[:8]} 完成 (实例: {instance.instance_id})")
+            else:
+                self.stats["failed_tasks"] += 1
+                logger.error(f"❌ 任务 {task.task_id[:8]} 失败: {result.get('error', '未知错误')}")
             
         except Exception as e:
             logger.error(f"❌ 处理任务 {task.task_id[:8]} 时发生错误: {e}")
@@ -424,7 +402,8 @@ class ConcurrentModelManager:
                 "task_id": task.task_id,
                 "device": instance.device,
                 "instance_id": instance.instance_id,
-                "cuda_visible_devices": instance.device.split(":")[1] if instance.device.startswith("cuda:") else "cpu"
+                "cuda_visible_devices": gpu_id if instance.device.startswith("cuda:") else "cpu",
+                "physical_gpu": gpu_id if instance.device.startswith("cuda:") else "cpu"
             }
             task.result_queue.put(result)
             
@@ -445,11 +424,18 @@ class ConcurrentModelManager:
             
             # 任务完成后的标准清理
             try:
-                if instance.device.startswith("cuda:"):
-                    gpu_id = int(instance.device.split(":")[1])
-                    with torch.cuda.device(gpu_id):
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
+                if instance.device.startswith("cuda:") and gpu_id is not None:
+                    # 在GPU隔离环境中进行清理
+                    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+                    if torch.cuda.is_available():
+                        with torch.cuda.device(0):  # 在隔离环境中总是使用设备0
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                    # 恢复环境变量
+                    if old_cuda_visible:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
+                    else:
+                        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
                     logger.debug(f"已清理GPU {instance.device} 缓存")
             except Exception as e:
                 logger.warning(f"清理GPU缓存时出错: {e}")
