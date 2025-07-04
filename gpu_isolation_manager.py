@@ -463,7 +463,7 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                     mask_image=mask_image,
                     height=height,
                     width=width,
-                    guidance_scale=30.0,  # Fill模式推荐使用30
+                    guidance_scale=task.get('cfg', 30.0),  # Fill模式推荐使用30
                     num_inference_steps=task.get('num_inference_steps', 50),
                     max_sequence_length=512,
                     generator=generator
