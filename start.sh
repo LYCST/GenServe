@@ -46,6 +46,9 @@ export FLUX_DEPTH_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Depth-dev"
 #Fill填充模型路径 (可选，如果不配置则跳过该模型)
 export FLUX_FILL_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Fill-dev"
 
+# Redux模型路径 (可选，如果不配置则跳过该模型)
+export FLUX_REDUX_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Redux-dev"
+
 # Canny边缘控制模型路径 (可选，如果不配置则跳过该模型)
 # export FLUX_CANNY_MODEL_PATH="/home/shuzuan/prj/models/flux1-canny-dev"
 
@@ -64,6 +67,9 @@ export FLUX_DEPTH_GPUS="5,6"
 
 # Fill模型GPU分配 (使用GPU 3，如果不配置则使用基础模型的GPU)
 export FLUX_FILL_GPUS="3,4"
+
+# Redux模型GPU分配 (使用GPU 7，如果不配置则使用基础模型的GPU)
+export FLUX_REDUX_GPUS="7"
 
 # Canny模型GPU分配 (使用GPU 0和2，如果不配置则使用基础模型的GPU)
 # export FLUX_CANNY_GPUS="0,2"
@@ -196,6 +202,15 @@ if [ -n "$FLUX_FILL_MODEL_PATH" ]; then
     else
         echo "⚠️  Fill模型路径不存在: $FLUX_FILL_MODEL_PATH (将跳过该模型)"
         unset FLUX_FILL_MODEL_PATH
+    fi
+fi
+
+if [ -n "$FLUX_REDUX_MODEL_PATH" ]; then
+    if [ -d "$FLUX_REDUX_MODEL_PATH" ]; then
+        echo "✅ Redux模型路径: $FLUX_REDUX_MODEL_PATH"
+    else
+        echo "⚠️  Redux模型路径不存在: $FLUX_REDUX_MODEL_PATH (将跳过该模型)"
+        unset FLUX_REDUX_MODEL_PATH
     fi
 fi
 

@@ -67,6 +67,7 @@ class Config:
         flux_fill_gpus = os.getenv("FLUX_FILL_GPUS", "")
         flux_canny_gpus = os.getenv("FLUX_CANNY_GPUS", "")
         flux_openpose_gpus = os.getenv("FLUX_OPENPOSE_GPUS", "")
+        flux_redux_gpus = os.getenv("FLUX_REDUX_GPUS", "")
         
         # 解析GPU列表
         def parse_gpu_list(gpu_str: str) -> List[str]:
@@ -127,6 +128,15 @@ class Config:
             else:
                 config["flux1-openpose-dev"] = all_gpus
         
+        # Redux模型 - 使用FLUX_REDUX_GPUS或基础模型的GPU
+        if "flux1-redux-dev" in configured_models:
+            if flux_redux_gpus:
+                config["flux1-redux-dev"] = parse_gpu_list(flux_redux_gpus)
+            elif "flux1-dev" in config:
+                config["flux1-redux-dev"] = config["flux1-dev"]
+            else:
+                config["flux1-redux-dev"] = all_gpus
+        
         return config
     
     # 模型路径配置
@@ -139,6 +149,7 @@ class Config:
             "flux1-fill-dev": os.getenv("FLUX_FILL_MODEL_PATH"),
             "flux1-canny-dev": os.getenv("FLUX_CANNY_MODEL_PATH"),
             "flux1-openpose-dev": os.getenv("FLUX_OPENPOSE_MODEL_PATH"),
+            "flux1-redux-dev": os.getenv("FLUX_REDUX_MODEL_PATH"),
         }
         
         # 只返回已配置的路径

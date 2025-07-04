@@ -38,7 +38,7 @@ class GenerateRequest(BaseModel):
     cfg: float = 3.5
     seed: int = 42
     priority: int = 0
-    mode: str = "text2img"  # text2img, img2img, fill, controlnet
+    mode: str = "text2img"  # text2img, img2img, fill, controlnet, redux
     strength: float = 0.8  # 用于img2img模式
     input_image: Optional[str] = None  # base64编码的输入图片
     mask_image: Optional[str] = None  # base64编码的蒙版图片（用于fill模式）
@@ -47,7 +47,7 @@ class GenerateRequest(BaseModel):
     controlnet_conditioning_scale: Optional[float] = None  # ControlNet条件强度，控制深度图影响程度
     control_guidance_start: Optional[float] = None  # ControlNet开始作用点（0-1），控制何时开始应用深度图
     control_guidance_end: Optional[float] = None  # ControlNet结束作用点（0-1），控制何时停止应用深度图
-    loras: Optional[List[Dict[str, Any]]] = None  # LoRA列表，每个LoRA包含name和weight
+    loras: Optional[List[Dict[str, Any]]] = None  # LoRA配置列表
 
 class GenerateResponse(BaseModel):
     success: bool
@@ -157,18 +157,16 @@ async def generate_image(request: GenerateRequest):
             raise HTTPException(status_code=400, detail="img2img模式需要提供input_image")
         elif request.mode == "fill" and (not request.input_image or not request.mask_image):
             raise HTTPException(status_code=400, detail="fill模式需要提供input_image和mask_image")
-        elif request.mode == "controlnet" and (not request.input_image or not request.control_image):
-            raise HTTPException(status_code=400, detail="controlnet模式需要提供input_image和control_image")
+        elif request.mode == "controlnet" and not request.control_image:
+            raise HTTPException(status_code=400, detail="controlnet模式需要提供control_image")
+        elif request.mode == "redux" and not request.input_image:
+            raise HTTPException(status_code=400, detail="redux模式需要提供input_image")
         
         # 验证controlnet类型
         if request.mode == "controlnet":
             valid_controlnet_types = ["depth", "canny", "openpose"]
             if request.controlnet_type.lower() not in valid_controlnet_types:
                 raise HTTPException(status_code=400, detail=f"不支持的controlnet类型: {request.controlnet_type}，支持的类型: {valid_controlnet_types}")
-            
-            # controlnet模式只需要control_image，input_image是可选的
-            if not request.control_image:
-                raise HTTPException(status_code=400, detail="controlnet模式需要提供control_image")
         
         # 验证LoRA参数
         if request.loras:
@@ -244,7 +242,7 @@ async def generate_image_upload_general(
     cfg: float = Form(3.5),
     seed: int = Form(42),
     priority: int = Form(0),
-    mode: str = Form("text2img"),
+    mode: str = Form("text2img"),  # text2img, img2img, fill, controlnet, redux
     strength: float = Form(0.8),
     input_image: Optional[UploadFile] = File(None),
     mask_image: Optional[UploadFile] = File(None),
@@ -253,7 +251,7 @@ async def generate_image_upload_general(
     controlnet_conditioning_scale: Optional[float] = Form(None),  # ControlNet条件强度
     control_guidance_start: Optional[float] = Form(None),  # ControlNet开始作用点
     control_guidance_end: Optional[float] = Form(None),  # ControlNet结束作用点
-    loras: Optional[str] = Form(None)  # JSON字符串格式的LoRA列表
+    loras: Optional[str] = Form(None)  # JSON格式的LoRA配置
 ):
     """生成图片 - 通用Form-data格式，支持所有模式的文件上传"""
     if not concurrent_manager:
@@ -338,6 +336,8 @@ async def generate_image_upload_general(
             raise HTTPException(status_code=400, detail="fill模式需要提供input_image和mask_image文件")
         elif mode == "controlnet" and not control_image_base64:
             raise HTTPException(status_code=400, detail="controlnet模式需要提供control_image文件")
+        elif mode == "redux" and not input_image_base64:
+            raise HTTPException(status_code=400, detail="redux模式需要提供input_image文件")
         
         # 调用进程级并发管理器
         result = await concurrent_manager.generate_image_async(

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, result_queue):
     """GPU工作进程 - 在隔离环境中运行（顶层函数，支持spawn）"""
     import torch
-    from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxFillPipeline, FluxControlPipeline
+    from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxFillPipeline, FluxControlPipeline, FluxPriorReduxPipeline
     import base64
     import io
     from PIL import Image
@@ -88,21 +88,29 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
         model_paths = Config.get_model_paths()
         actual_model_path = model_paths.get(model_id, model_path)
         
+        # 对于Redux模型，需要特殊处理：基础pipeline使用flux1-dev模型路径
+        if model_id == "flux1-redux-dev":
+            base_model_path = model_paths.get("flux1-dev", actual_model_path)
+            logger.info(f"GPU {gpu_id} Redux模型使用基础模型路径: {base_model_path}")
+        else:
+            base_model_path = actual_model_path
+        
         logger.info(f"GPU {gpu_id} 使用模型路径: {actual_model_path}")
         
-        # 初始化pipeline字典 - 支持多种controlnet类型
+        # 初始化pipeline字典 - 支持多种controlnet类型和redux
         pipelines = {
             "text2img": None,
             "img2img": None,
             "fill": None,
             "controlnet_depth": None,
             "controlnet_canny": None,
-            "controlnet_openpose": None
+            "controlnet_openpose": None,
+            "redux": None
         }
         
         # 加载基础text2img pipeline
         pipelines["text2img"] = FluxPipeline.from_pretrained(
-            actual_model_path,
+            base_model_path,
             torch_dtype=torch.bfloat16,
             use_safetensors=True,
             local_files_only=True
@@ -276,7 +284,7 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
     import traceback
     from PIL import Image
     import os
-    from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxFillPipeline, FluxControlPipeline
+    from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxFillPipeline, FluxControlPipeline, FluxPriorReduxPipeline
     
     # 尝试导入PEFT相关库
     try:
@@ -468,6 +476,56 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                     raise ValueError(f"无法加载{controlnet_type} ControlNet pipeline。请确保模型路径包含ControlNet组件: {controlnet_model_path}")
             
             pipe = pipelines[pipeline_key]
+        elif mode == 'redux':
+            if pipelines["redux"] is None:
+                logger.info(f"GPU {gpu_id} 加载redux pipeline...")
+                
+                # 使用专门的Redux模型路径
+                model_paths = Config.get_model_paths()
+                redux_model_path = model_paths.get("flux1-redux-dev", actual_model_path)
+                
+                # 对于Redux，基础pipeline需要使用flux1-dev模型路径
+                base_model_path = model_paths.get("flux1-dev", actual_model_path)
+                
+                if not os.path.exists(redux_model_path):
+                    # 如果专用Redux模型路径不存在，使用基础路径
+                    redux_model_path = actual_model_path
+                    logger.warning(f"GPU {gpu_id} 专用Redux模型路径不存在，使用基础模型: {redux_model_path}")
+                else:
+                    logger.info(f"GPU {gpu_id} 使用Redux模型路径: {redux_model_path}")
+                
+                logger.info(f"GPU {gpu_id} 使用基础模型路径: {base_model_path}")
+                
+                try:
+                    # 加载Redux pipeline - 需要两个pipeline
+                    pipelines["redux"] = {
+                        "prior": FluxPriorReduxPipeline.from_pretrained(
+                            redux_model_path,
+                            torch_dtype=torch.bfloat16,
+                            use_safetensors=True,
+                            local_files_only=True
+                        ),
+                        "base": FluxPipeline.from_pretrained(
+                            base_model_path,  # 使用基础模型路径，而不是redux模型路径
+                            text_encoder=None,
+                            text_encoder_2=None,
+                            torch_dtype=torch.bfloat16,
+                            use_safetensors=True,
+                            local_files_only=True
+                        )
+                    }
+                    
+                    # 启用CPU卸载
+                    pipelines["redux"]["prior"].enable_model_cpu_offload(device="cuda:0")
+                    pipelines["redux"]["base"].enable_model_cpu_offload(device="cuda:0")
+                    
+                    logger.info(f"GPU {gpu_id} redux pipeline加载完成")
+                except Exception as e:
+                    logger.error(f"GPU {gpu_id} 加载redux pipeline失败: {e}")
+                    # Redux pipeline加载失败，直接抛出错误
+                    raise ValueError(f"无法加载Redux pipeline。请确保模型路径包含Redux组件: {redux_model_path}")
+            
+            pipe = pipelines["redux"]
         else:
             raise ValueError(f"不支持的生成模式: {mode}")
         
@@ -617,6 +675,35 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                     logger.info(f"GPU {gpu_id} 用户提供了control_guidance_end: {task.get('control_guidance_end')}，但FluxControlPipeline不支持此参数")
                 
                 result = pipe(**controlnet_kwargs)
+            elif mode == 'redux':
+                # 加载输入图片
+                input_image = load_image_func(task.get('input_image'))
+                
+                # 获取尺寸：优先使用用户指定，否则使用图片原始尺寸
+                width, height = get_output_dimensions(input_image, mode)
+                
+                logger.info(f"GPU {gpu_id} 开始Redux处理，输入图片尺寸: {input_image.size}")
+                
+                # Redux处理流程：先运行prior pipeline，再运行base pipeline
+                try:
+                    # 第一步：运行prior pipeline
+                    logger.info(f"GPU {gpu_id} 运行Redux prior pipeline...")
+                    prior_output = pipe["prior"](input_image)
+                    
+                    # 第二步：运行base pipeline
+                    logger.info(f"GPU {gpu_id} 运行Redux base pipeline...")
+                    result = pipe["base"](
+                        guidance_scale=task.get('cfg', 2.5),  # Redux推荐使用2.5
+                        num_inference_steps=task.get('num_inference_steps', 50),
+                        generator=generator,
+                        **prior_output
+                    )
+                    
+                    logger.info(f"GPU {gpu_id} Redux处理完成")
+                    
+                except Exception as e:
+                    logger.error(f"GPU {gpu_id} Redux处理失败: {e}")
+                    raise ValueError(f"Redux处理失败: {str(e)}")
             else:
                 raise ValueError(f"不支持的生成模式: {mode}")
         
