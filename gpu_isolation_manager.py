@@ -464,9 +464,8 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                     logger.info(f"GPU {gpu_id} {controlnet_type} controlnet pipeline加载完成")
                 except Exception as e:
                     logger.error(f"GPU {gpu_id} 加载{controlnet_type} controlnet pipeline失败: {e}")
-                    # 如果controlnet加载失败，回退到基础pipeline
-                    logger.info(f"GPU {gpu_id} 回退到基础pipeline")
-                    pipelines[pipeline_key] = pipelines["text2img"]
+                    # ControlNet pipeline加载失败，直接抛出错误
+                    raise ValueError(f"无法加载{controlnet_type} ControlNet pipeline。请确保模型路径包含ControlNet组件: {controlnet_model_path}")
             
             pipe = pipelines[pipeline_key]
         else:
