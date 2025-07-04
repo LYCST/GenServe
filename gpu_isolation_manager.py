@@ -29,7 +29,18 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
     import gc
     import psutil
     import os
-
+    
+    # 尝试导入PEFT相关库
+    try:
+        from peft import PeftModel
+        PEFT_AVAILABLE = True
+    except ImportError:
+        PEFT_AVAILABLE = False
+        logging.warning(f"PEFT库未安装，LoRA功能将不可用")
+    
+    # 注意：PeftConfig在新版本transformers中可能不可用，我们只需要PEFT库本身
+    TRANSFORMERS_PEFT_AVAILABLE = True  # 简化检查，主要依赖PEFT库
+    
     logger = logging.getLogger(f"gpu_worker_{gpu_id}")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
     
@@ -266,8 +277,33 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
     from PIL import Image
     import os
     from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxFillPipeline, FluxControlPipeline
+    
+    # 尝试导入PEFT相关库
+    try:
+        from peft import PeftModel
+        PEFT_AVAILABLE = True
+    except ImportError:
+        PEFT_AVAILABLE = False
+        logging.warning(f"PEFT库未安装，LoRA功能将不可用")
+    
+    # 注意：PeftConfig在新版本transformers中可能不可用，我们只需要PEFT库本身
+    TRANSFORMERS_PEFT_AVAILABLE = True  # 简化检查，主要依赖PEFT库
+    
     logger = logging.getLogger(f"gpu_worker_{gpu_id}")
     start_time = time.time()
+    
+    def create_safe_adapter_name(lora_name: str, index: int, timestamp: int, random_suffix: int) -> str:
+        """创建安全的adapter名称"""
+        # 移除所有特殊字符，只保留字母、数字和下划线
+        import re
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', lora_name)
+        # 确保不以数字开头
+        if safe_name and safe_name[0].isdigit():
+            safe_name = 'lora_' + safe_name
+        # 限制长度
+        if len(safe_name) > 50:
+            safe_name = safe_name[:50]
+        return f"lora_{index}_{safe_name}_{timestamp}_{random_suffix}"
     
     # 记录任务开始时的内存状态
     if torch.cuda.is_available():
@@ -419,6 +455,68 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
         else:
             raise ValueError(f"不支持的生成模式: {mode}")
         
+        # 加载和应用LoRA
+        loras = task.get('loras', [])
+        if loras:
+            if not PEFT_AVAILABLE:
+                raise ValueError("PEFT库未安装，无法使用LoRA功能。请安装: pip install peft")
+            
+            logger.info(f"GPU {gpu_id} 开始加载 {len(loras)} 个LoRA...")
+            
+            adapter_names = []
+            adapter_weights = []
+            
+            # 添加时间戳和随机数确保adapter_name唯一性
+            import time
+            import random
+            timestamp = int(time.time() * 1000)  # 毫秒时间戳
+            random_suffix = random.randint(1000, 9999)  # 4位随机数
+            
+            for i, lora in enumerate(loras):
+                lora_name = lora.get('name')
+                lora_weight = lora.get('weight', 1.0)
+                
+                # 获取LoRA路径
+                lora_path = Config.get_lora_path(lora_name)
+                if not lora_path:
+                    raise ValueError(f"LoRA '{lora_name}' 不存在")
+                
+                # 生成唯一的adapter_name
+                adapter_name = create_safe_adapter_name(lora_name, i, timestamp, random_suffix)
+                adapter_names.append(adapter_name)
+                adapter_weights.append(lora_weight)
+                
+                try:
+                    logger.info(f"GPU {gpu_id} 加载LoRA: {lora_name} (权重: {lora_weight}) -> adapter: {adapter_name}")
+                    
+                    # 检查LoRA文件是否存在
+                    if not os.path.exists(lora_path):
+                        raise ValueError(f"LoRA文件不存在: {lora_path}")
+                    
+                    # 尝试加载LoRA
+                    pipe.load_lora_weights(lora_path, adapter_name=adapter_name)
+                    logger.info(f"GPU {gpu_id} LoRA {lora_name} 加载成功")
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    if "PEFT backend is required" in error_msg:
+                        raise ValueError(f"PEFT后端未正确配置。请确保安装了正确的PEFT版本: pip install peft transformers")
+                    elif "not a valid LoRA" in error_msg:
+                        raise ValueError(f"LoRA文件格式无效或与当前模型不兼容: {lora_name}")
+                    elif "already in use" in error_msg:
+                        raise ValueError(f"LoRA适配器名称冲突，请重试: {lora_name}")
+                    else:
+                        raise ValueError(f"加载LoRA {lora_name} 失败: {error_msg}")
+            
+            # 设置LoRA适配器
+            if adapter_names:
+                try:
+                    pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
+                    logger.info(f"GPU {gpu_id} 设置LoRA适配器: {adapter_names} (权重: {adapter_weights})")
+                except Exception as e:
+                    logger.error(f"GPU {gpu_id} 设置LoRA适配器失败: {e}")
+                    raise ValueError(f"设置LoRA适配器失败: {str(e)}")
+        
         with torch.no_grad():
             if mode == 'text2img':
                 result = pipe(
@@ -481,8 +579,8 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                     control_image=control_image,
                     height=height,
                     width=width,
-                    guidance_scale=task.get('cfg', 3.5),
-                    num_inference_steps=task.get('num_inference_steps', 50),
+                    guidance_scale=task.get('cfg', 10.0),  # controlnet推荐使用10.0
+                    num_inference_steps=task.get('num_inference_steps', 30),  # controlnet推荐使用30步
                     max_sequence_length=512,
                     generator=generator
                 )

@@ -235,7 +235,8 @@ class ProcessConcurrentModelManager:
                 "input_image": task.params.get('input_image'),
                 "mask_image": task.params.get('mask_image'),
                 "control_image": task.params.get('control_image'),
-                "controlnet_type": task.params.get('controlnet_type', 'depth')
+                "controlnet_type": task.params.get('controlnet_type', 'depth'),
+                "loras": task.params.get('loras', [])
             }
             
             # 提交任务到GPU进程
@@ -302,7 +303,8 @@ class ProcessConcurrentModelManager:
         input_image: Optional[str] = None,
         mask_image: Optional[str] = None,
         control_image: Optional[str] = None,
-        controlnet_type: str = "depth"
+        controlnet_type: str = "depth",
+        loras: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """异步生成图片 - 支持图生图"""
         if not self.is_running:
@@ -352,7 +354,8 @@ class ProcessConcurrentModelManager:
             "input_image": input_image,
             "mask_image": mask_image,
             "control_image": control_image,
-            "controlnet_type": controlnet_type.lower()
+            "controlnet_type": controlnet_type.lower(),
+            "loras": loras
         }
         
         task = GenerationTask(

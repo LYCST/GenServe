@@ -1,6 +1,9 @@
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import torch
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Config:
     """应用配置类 - 改进版本"""
@@ -307,3 +310,63 @@ class Config:
         print(f"  任务超时: {config['concurrent']['task_timeout']}秒")
         
         print("=" * 50)
+
+    # LoRA配置
+    LORA_BASE_PATH = os.getenv("LORA_BASE_PATH", "/home/shuzuan/prj/models/loras")
+    
+    @classmethod
+    def get_lora_list(cls) -> List[Dict[str, Any]]:
+        """获取LoRA文件列表"""
+        loras = []
+        base_path = cls.LORA_BASE_PATH
+        
+        if not os.path.exists(base_path):
+            return loras
+        
+        try:
+            # 递归查找所有.safetensors文件
+            for root, dirs, files in os.walk(base_path):
+                for file in files:
+                    if file.endswith('.safetensors'):
+                        file_path = os.path.join(root, file)
+                        
+                        # 计算相对路径作为LoRA名称（保留.safetensors后缀）
+                        relative_path = os.path.relpath(file_path, base_path)
+                        lora_name = relative_path  # 保留完整文件名，包括.safetensors后缀
+                        
+                        # 获取文件大小
+                        file_size = os.path.getsize(file_path)
+                        size_mb = round(file_size / (1024 * 1024), 2)
+                        
+                        # 确定分类（基于文件夹结构）
+                        if root == base_path:
+                            category = "root"
+                        else:
+                            # 获取相对于base_path的第一级子文件夹作为分类
+                            rel_root = os.path.relpath(root, base_path)
+                            category = rel_root.split(os.sep)[0] if os.sep in rel_root else rel_root
+                        
+                        loras.append({
+                            "name": lora_name,  # 包含子文件夹路径和.safetensors后缀的完整名称
+                            "path": file_path,
+                            "size_mb": size_mb,
+                            "category": category
+                        })
+            
+            # 按名称排序
+            loras.sort(key=lambda x: x["name"])
+            
+        except Exception as e:
+            logger.error(f"获取LoRA列表失败: {e}")
+        
+        return loras
+    
+    @classmethod
+    def get_lora_path(cls, lora_name: str) -> Optional[str]:
+        """根据LoRA名称获取完整路径"""
+        lora_list = cls.get_lora_list()
+        
+        for lora in lora_list:
+            if lora['name'] == lora_name:
+                return lora['path']
+        return None

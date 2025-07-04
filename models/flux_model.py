@@ -453,7 +453,7 @@ class FluxModel(BaseModel):
             return False
         elif mode == 'fill' and (not kwargs.get('input_image') or not kwargs.get('mask_image')):
             return False
-        elif mode == 'controlnet' and (not kwargs.get('input_image') or not kwargs.get('control_image')):
+        elif mode == 'controlnet' and not kwargs.get('control_image'):
             return False
         
         return True

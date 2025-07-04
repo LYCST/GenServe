@@ -7,11 +7,12 @@ import sys
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import uvicorn
 from contextlib import asynccontextmanager
 import base64
 import io
+import json
 
 # 导入进程级并发管理器
 from models.process_concurrent_manager import ProcessConcurrentModelManager
@@ -43,6 +44,7 @@ class GenerateRequest(BaseModel):
     mask_image: Optional[str] = None  # base64编码的蒙版图片（用于fill模式）
     control_image: Optional[str] = None  # base64编码的控制图片（用于controlnet模式）
     controlnet_type: str = "depth"  # controlnet类型：depth, canny, openpose
+    loras: Optional[List[Dict[str, Any]]] = None  # LoRA列表，每个LoRA包含name和weight
 
 class GenerateResponse(BaseModel):
     success: bool
@@ -160,6 +162,33 @@ async def generate_image(request: GenerateRequest):
             valid_controlnet_types = ["depth", "canny", "openpose"]
             if request.controlnet_type.lower() not in valid_controlnet_types:
                 raise HTTPException(status_code=400, detail=f"不支持的controlnet类型: {request.controlnet_type}，支持的类型: {valid_controlnet_types}")
+            
+            # controlnet模式只需要control_image，input_image是可选的
+            if not request.control_image:
+                raise HTTPException(status_code=400, detail="controlnet模式需要提供control_image")
+        
+        # 验证LoRA参数
+        if request.loras:
+            for lora in request.loras:
+                if not isinstance(lora, dict):
+                    raise HTTPException(status_code=400, detail="每个LoRA必须是字典格式")
+                if 'name' not in lora:
+                    raise HTTPException(status_code=400, detail="每个LoRA必须包含name字段")
+                if 'weight' not in lora:
+                    raise HTTPException(status_code=400, detail="每个LoRA必须包含weight字段")
+                
+                # 验证LoRA是否存在
+                lora_path = Config.get_lora_path(lora['name'])
+                if not lora_path:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"LoRA '{lora['name']}' 不存在，请检查 /loras 接口获取可用LoRA列表"
+                    )
+                
+                # 验证权重范围
+                weight = lora.get('weight', 1.0)
+                if not isinstance(weight, (int, float)) or weight < 0 or weight > 2:
+                    raise HTTPException(status_code=400, detail="LoRA权重必须在0-2之间")
         
         # 调用进程级并发管理器
         result = await concurrent_manager.generate_image_async(
@@ -176,7 +205,8 @@ async def generate_image(request: GenerateRequest):
             input_image=request.input_image,
             mask_image=request.mask_image,
             control_image=request.control_image,
-            controlnet_type=request.controlnet_type
+            controlnet_type=request.controlnet_type,
+            loras=request.loras
         )
         
         # 构建响应
@@ -213,7 +243,8 @@ async def generate_image_upload_general(
     input_image: Optional[UploadFile] = File(None),
     mask_image: Optional[UploadFile] = File(None),
     control_image: Optional[UploadFile] = File(None),
-    controlnet_type: str = Form("depth")
+    controlnet_type: str = Form("depth"),
+    loras: Optional[str] = Form(None)  # JSON字符串格式的LoRA列表
 ):
     """生成图片 - 通用Form-data格式，支持所有模式的文件上传"""
     if not concurrent_manager:
@@ -256,13 +287,48 @@ async def generate_image_upload_general(
         if control_image:
             control_image_base64 = await file_to_base64(control_image)
         
+        # 处理LoRA参数
+        loras_list = None
+        if loras:
+            try:
+                loras_list = json.loads(loras)
+                # 验证LoRA格式
+                if not isinstance(loras_list, list):
+                    raise ValueError("loras参数必须是列表格式")
+                
+                for lora in loras_list:
+                    if not isinstance(lora, dict):
+                        raise ValueError("每个LoRA必须是字典格式")
+                    if 'name' not in lora:
+                        raise ValueError("每个LoRA必须包含name字段")
+                    if 'weight' not in lora:
+                        raise ValueError("每个LoRA必须包含weight字段")
+                    
+                    # 验证LoRA是否存在
+                    lora_path = Config.get_lora_path(lora['name'])
+                    if not lora_path:
+                        raise HTTPException(
+                            status_code=400, 
+                            detail=f"LoRA '{lora['name']}' 不存在，请检查 /loras 接口获取可用LoRA列表"
+                        )
+                    
+                    # 验证权重范围
+                    weight = lora.get('weight', 1.0)
+                    if not isinstance(weight, (int, float)) or weight < 0 or weight > 2:
+                        raise ValueError("LoRA权重必须在0-2之间")
+                        
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="loras参数必须是有效的JSON格式")
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+        
         # 验证模式特定参数
         if mode == "img2img" and not input_image_base64:
             raise HTTPException(status_code=400, detail="img2img模式需要提供input_image文件")
         elif mode == "fill" and (not input_image_base64 or not mask_image_base64):
             raise HTTPException(status_code=400, detail="fill模式需要提供input_image和mask_image文件")
-        elif mode == "controlnet" and (not input_image_base64 or not control_image_base64):
-            raise HTTPException(status_code=400, detail="controlnet模式需要提供input_image和control_image文件")
+        elif mode == "controlnet" and not control_image_base64:
+            raise HTTPException(status_code=400, detail="controlnet模式需要提供control_image文件")
         
         # 调用进程级并发管理器
         result = await concurrent_manager.generate_image_async(
@@ -279,7 +345,8 @@ async def generate_image_upload_general(
             input_image=input_image_base64,
             mask_image=mask_image_base64,
             control_image=control_image_base64,
-            controlnet_type=controlnet_type
+            controlnet_type=controlnet_type,
+            loras=loras_list
         )
         
         # 构建响应
@@ -332,6 +399,28 @@ async def get_models():
     except Exception as e:
         logger.error(f"获取模型列表时出错: {e}")
         return {"error": str(e)}
+
+@app.get("/loras")
+async def get_loras():
+    """获取LoRA模型列表"""
+    try:
+        loras = Config.get_lora_list()
+        return {
+            "success": True,
+            "loras": loras,
+            "total_count": len(loras),
+            "base_path": Config.LORA_BASE_PATH
+        }
+        
+    except Exception as e:
+        logger.error(f"获取LoRA列表时出错: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "loras": [],
+            "total_count": 0,
+            "base_path": Config.LORA_BASE_PATH
+        }
 
 @app.get("/health")
 async def health_check():

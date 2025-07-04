@@ -37,6 +37,9 @@ export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:64,ga
 # 基础Flux模型路径 (必须配置)
 export FLUX_MODEL_PATH="/home/shuzuan/prj/models/flux1-dev"
 
+# LoRA模型路径 (可选，如果不配置则使用默认路径)
+export LORA_BASE_PATH="/home/shuzuan/prj/models/loras"
+
 # Depth控制模型路径 (可选，如果不配置则跳过该模型)
 # export FLUX_DEPTH_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Depth-dev"
 
@@ -154,6 +157,29 @@ fi
 
 echo "✅ 基础模型路径: $FLUX_MODEL_PATH"
 
+# 检查LoRA路径
+if [ -d "$LORA_BASE_PATH" ]; then
+    echo "✅ LoRA路径: $LORA_BASE_PATH"
+    # 统计LoRA文件数量
+    lora_count=$(find "$LORA_BASE_PATH" -name "*.safetensors" -type f | wc -l)
+    echo "   发现 $lora_count 个LoRA文件"
+    
+    if [ $lora_count -gt 0 ]; then
+        echo "   📁 LoRA文件列表:"
+        find "$LORA_BASE_PATH" -name "*.safetensors" -type f | head -5 | while read file; do
+            filename=$(basename "$file" .safetensors)
+            size=$(du -h "$file" | cut -f1)
+            echo "      - $filename ($size)"
+        done
+        
+        if [ $lora_count -gt 5 ]; then
+            echo "      ... 还有 $((lora_count - 5)) 个文件"
+        fi
+    fi
+else
+    echo "⚠️  LoRA路径不存在: $LORA_BASE_PATH (LoRA功能将不可用)"
+fi
+
 # 检查可选模型路径
 if [ -n "$FLUX_DEPTH_MODEL_PATH" ]; then
     if [ -d "$FLUX_DEPTH_MODEL_PATH" ]; then
@@ -208,6 +234,30 @@ if [ -f "requirements.txt" ]; then
     fi
 else
     echo "⚠️  requirements.txt 文件不存在"
+fi
+
+# =============================================================================
+# 检查PEFT依赖
+# =============================================================================
+
+echo "🔍 检查PEFT依赖..."
+python3 -c "
+try:
+    from peft import PeftModel
+    print('✅ PEFT 库已安装')
+except ImportError:
+    print('❌ PEFT 库未安装')
+    print('💡 请运行: ./install_peft.sh 或 pip install peft>=0.7.0')
+    exit(1)
+
+# 注意：PeftConfig在新版本transformers中可能不可用，我们只需要PEFT库本身
+print('✅ PEFT 依赖检查通过')
+"
+
+if [ $? -ne 0 ]; then
+    echo "❌ PEFT依赖检查失败"
+    echo "💡 请运行: ./install_peft.sh"
+    exit 1
 fi
 
 # =============================================================================

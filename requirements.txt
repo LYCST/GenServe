@@ -1,15 +1,25 @@
-fastapi
-uvicorn
-diffusers
-transformers
-torch
-torchvision
-accelerate
-safetensors
-Pillow
-python-multipart
-pydantic
-matplotlib
-numpy
-psutil
-git+https://github.com/asomoza/image_gen_aux.git
+# GenServe 依赖包
+# 核心依赖
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.24.0
+transformers>=4.35.0
+accelerate>=0.24.0
+
+# LoRA支持
+peft>=0.7.0
+
+# Web框架
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
+
+# 图像处理
+Pillow>=10.0.0
+
+# 系统监控
+psutil>=5.9.0
+
+# 其他工具
+numpy>=1.24.0
+requests>=2.31.0
