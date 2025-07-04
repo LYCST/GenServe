@@ -51,6 +51,7 @@ GenServe是一个基于Flux模型的多GPU并发图片生成服务，支持多�
 | input_image | string | 条件 | null | 输入图片(base64) |
 | mask_image | string | 条件 | null | 蒙版图片(base64) |
 | control_image | string | 条件 | null | 控制图片(base64) |
+| controlnet_type | string | 是 | "depth" | ControlNet类型，支持：`depth`、`canny`、`openpose` |
 
 #### 请求示例
 
@@ -64,15 +65,16 @@ GenServe是一个基于Flux模型的多GPU并发图片生成服务，支持多�
   "width": 1024,
   "num_inference_steps": 50,
   "cfg": 3.5,
-  "seed": 42
+  "seed": 42,
+  "controlnet_type": "depth"
 }
 ```
 
-### 2. 生成图片 (Form-data方式)
+### 2. 生成图片 (通用Form-data方式) - 推荐
 
-**端点**: `POST /generate/img2img`
+**端点**: `POST /generate/upload`
 
-**描述**: 使用Form-data格式和文件上传生成图片（推荐用于大图片）
+**描述**: 使用Form-data格式和文件上传生成图片，支持所有生成模式（推荐用于所有图片上传）
 
 #### 请求参数
 
@@ -91,12 +93,25 @@ GenServe是一个基于Flux模型的多GPU并发图片生成服务，支持多�
 | input_image | file | 条件 | null | 输入图片文件 |
 | mask_image | file | 条件 | null | 蒙版图片文件 |
 | control_image | file | 条件 | null | 控制图片文件 |
+| controlnet_type | string | 是 | "depth" | ControlNet类型，支持：`depth`、`canny`、`openpose` |
 
 #### 请求示例
 
 ```bash
-curl -X POST "http://localhost:12411/generate/img2img" \
+# 文本生成图片
+curl -X POST "http://localhost:12411/generate/upload" \
      -F "prompt=A beautiful sunset over mountains" \
+     -F "mode=text2img" \
+     -F "height=1024" \
+     -F "width=1024" \
+     -F "num_inference_steps=50" \
+     -F "cfg=3.5" \
+     -F "seed=42" \
+     -F "controlnet_type=depth"
+
+# 图片生成图片
+curl -X POST "http://localhost:12411/generate/upload" \
+     -F "prompt=A beautiful landscape with mountains and trees" \
      -F "mode=img2img" \
      -F "input_image=@input_image.png" \
      -F "strength=0.7" \
@@ -104,7 +119,73 @@ curl -X POST "http://localhost:12411/generate/img2img" \
      -F "width=1024" \
      -F "num_inference_steps=50" \
      -F "cfg=3.5" \
+     -F "seed=42" \
+     -F "controlnet_type=depth"
+
+# 填充/修复
+curl -X POST "http://localhost:12411/generate/upload" \
+     -F "prompt=A beautiful flower garden in the center" \
+     -F "mode=fill" \
+     -F "input_image=@input_image.png" \
+     -F "mask_image=@mask_image.png" \
+     -F "height=1024" \
+     -F "width=1024" \
+     -F "num_inference_steps=50" \
+     -F "cfg=3.5" \
+     -F "seed=42" \
+     -F "controlnet_type=depth"
+
+# ControlNet
+curl -X POST "http://localhost:12411/generate/upload" \
+     -F "prompt=A futuristic city with skyscrapers" \
+     -F "mode=controlnet" \
+     -F "controlnet_type=canny" \
+     -F "input_image=@input_image.png" \
+     -F "control_image=@canny_edges.png" \
+     -F "height=1024" \
+     -F "width=1024" \
+     -F "num_inference_steps=50" \
+     -F "cfg=3.5" \
      -F "seed=42"
+```
+
+### 3. 生成图片 (Form-data方式) - 向后兼容
+
+**端点**: `POST /generate/img2img`
+
+**描述**: 使用Form-data格式和文件上传生成图片（向后兼容端点，功能与/generate/upload相同）
+
+#### 请求参数
+
+| 参数 | 类型 | 必需 | 默认值 | 描述 |
+|------|------|------|--------|------|
+| prompt | string | ✅ | - | 提示词 |
+| model_id | string | ❌ | "flux1-dev" | 模型ID |
+| mode | string | ❌ | "text2img" | 生成模式 |
+| height | integer | ❌ | 1024 | 图片高度 |
+| width | integer | ❌ | 1024 | 图片宽度 |
+| num_inference_steps | integer | ❌ | 50 | 推理步数 |
+| cfg | float | ❌ | 3.5 | 引导强度 |
+| seed | integer | ❌ | 42 | 随机种子 |
+| priority | integer | ❌ | 0 | 任务优先级 |
+| strength | float | ❌ | 0.8 | img2img强度 |
+| input_image | file | 条件 | null | 输入图片文件 |
+| mask_image | file | 条件 | null | 蒙版图片文件 |
+| control_image | file | 条件 | null | 控制图片文件 |
+| controlnet_type | string | 是 | "depth" | ControlNet类型，支持：`depth`、`canny`、`openpose` |
+
+#### 请求示例
+
+```bash
+curl -X POST "http://localhost:12411/generate/img2img" \
+     -F "prompt=A beautiful sunset over mountains" \
+     -F "mode=text2img" \
+     -F "height=1024" \
+     -F "width=1024" \
+     -F "num_inference_steps=50" \
+     -F "cfg=3.5" \
+     -F "seed=42" \
+     -F "controlnet_type=depth"
 ```
 
 #### 生成模式说明
@@ -140,7 +221,8 @@ curl -X POST "http://localhost:12411/generate/img2img" \
   "elapsed_time": 15.23,
   "gpu_id": "cuda:0",
   "model_id": "flux1-dev",
-  "mode": "text2img"
+  "mode": "text2img",
+  "controlnet_type": "depth"
 }
 ```
 
@@ -155,11 +237,12 @@ curl -X POST "http://localhost:12411/generate/img2img" \
   "elapsed_time": 0.0,
   "gpu_id": null,
   "model_id": "flux1-dev",
-  "mode": "text2img"
+  "mode": "text2img",
+  "controlnet_type": "depth"
 }
 ```
 
-### 3. 服务状态
+### 4. 服务状态
 
 **端点**: `GET /status`
 
@@ -179,7 +262,7 @@ curl -X POST "http://localhost:12411/generate/img2img" \
 }
 ```
 
-### 4. 模型列表
+### 5. 模型列表
 
 **端点**: `GET /models`
 
@@ -222,7 +305,8 @@ def text2img_json_example():
         "width": 1024,
         "num_inference_steps": 50,
         "cfg": 3.5,
-        "seed": 42
+        "seed": 42,
+        "controlnet_type": "depth"
     }
     
     response = requests.post(f"{base_url}/generate", json=payload)
@@ -235,11 +319,12 @@ def text2img_json_example():
         image.save("generated_image.png")
         print(f"图片已保存，耗时: {result['elapsed_time']:.2f}秒")
 
-# 2. Form-data方式 (文件上传) - 推荐用于大图片
-def img2img_form_example():
+# 2. 通用Form-data方式 (文件上传) - 推荐用于所有图片上传
+def general_form_example():
     # 准备文件
     files = {
-        'input_image': ('input.png', open('input_image.png', 'rb'), 'image/png')
+        'input_image': ('input.png', open('input_image.png', 'rb'), 'image/png'),
+        'control_image': ('control.png', open('control_image.png', 'rb'), 'image/png')
     }
     
     data = {
@@ -250,10 +335,11 @@ def img2img_form_example():
         "width": "1024",
         "num_inference_steps": "50",
         "cfg": "3.5",
-        "seed": "42"
+        "seed": "42",
+        "controlnet_type": "depth"
     }
     
-    response = requests.post(f"{base_url}/generate/img2img", files=files, data=data)
+    response = requests.post(f"{base_url}/generate/upload", files=files, data=data)
     result = response.json()
     
     if result["success"]:
@@ -263,11 +349,34 @@ def img2img_form_example():
         image.save("img2img_result.png")
         print(f"图片已保存，耗时: {result['elapsed_time']:.2f}秒")
 
-# 3. 填充/修复示例 (Form-data)
+# 3. 文本生成图片 (Form-data方式)
+def text2img_form_example():
+    data = {
+        "prompt": "A beautiful sunset over mountains, digital art",
+        "mode": "text2img",
+        "height": "1024",
+        "width": "1024",
+        "num_inference_steps": "50",
+        "cfg": "3.5",
+        "seed": "42",
+        "controlnet_type": "depth"
+    }
+    
+    response = requests.post(f"{base_url}/generate/upload", data=data)
+    result = response.json()
+    
+    if result["success"]:
+        image_data = base64.b64decode(result["image_base64"])
+        image = Image.open(io.BytesIO(image_data))
+        image.save("text2img_result.png")
+        print(f"图片已保存，耗时: {result['elapsed_time']:.2f}秒")
+
+# 4. 填充/修复示例 (Form-data)
 def fill_form_example():
     files = {
         'input_image': ('input.png', open('input_image.png', 'rb'), 'image/png'),
-        'mask_image': ('mask.png', open('mask_image.png', 'rb'), 'image/png')
+        'mask_image': ('mask.png', open('mask_image.png', 'rb'), 'image/png'),
+        'control_image': ('control.png', open('control_image.png', 'rb'), 'image/png')
     }
     
     data = {
@@ -277,16 +386,44 @@ def fill_form_example():
         "width": "1024",
         "num_inference_steps": "50",
         "cfg": "3.5",
-        "seed": "42"
+        "seed": "42",
+        "controlnet_type": "depth"
     }
     
-    response = requests.post(f"{base_url}/generate/img2img", files=files, data=data)
+    response = requests.post(f"{base_url}/generate/upload", files=files, data=data)
     result = response.json()
     
     if result["success"]:
         image_data = base64.b64decode(result["image_base64"])
         image = Image.open(io.BytesIO(image_data))
         image.save("fill_result.png")
+        print(f"图片已保存，耗时: {result['elapsed_time']:.2f}秒")
+
+# 5. ControlNet示例 (Form-data)
+def controlnet_form_example():
+    files = {
+        'input_image': ('input.png', open('input_image.png', 'rb'), 'image/png'),
+        'control_image': ('canny_edges.png', open('canny_edges.png', 'rb'), 'image/png')
+    }
+    
+    data = {
+        "prompt": "A futuristic city with skyscrapers",
+        "mode": "controlnet",
+        "controlnet_type": "canny",
+        "height": "1024",
+        "width": "1024",
+        "num_inference_steps": "50",
+        "cfg": "3.5",
+        "seed": "42"
+    }
+    
+    response = requests.post(f"{base_url}/generate/upload", files=files, data=data)
+    result = response.json()
+    
+    if result["success"]:
+        image_data = base64.b64decode(result["image_base64"])
+        image = Image.open(io.BytesIO(image_data))
+        image.save("controlnet_result.png")
         print(f"图片已保存，耗时: {result['elapsed_time']:.2f}秒")
 ```
 
@@ -303,26 +440,56 @@ curl -X POST "http://localhost:12411/generate" \
        "width": 1024,
        "num_inference_steps": 50,
        "cfg": 3.5,
-       "seed": 42
+       "seed": 42,
+       "controlnet_type": "depth"
      }'
 
-# Form-data方式 - 图片生成图片 (推荐)
-curl -X POST "http://localhost:12411/generate/img2img" \
+# 通用Form-data方式 - 文本生成图片 (推荐)
+curl -X POST "http://localhost:12411/generate/upload" \
+     -F "prompt=A beautiful sunset over mountains" \
+     -F "mode=text2img" \
+     -F "height=1024" \
+     -F "width=1024" \
+     -F "num_inference_steps=50" \
+     -F "cfg=3.5" \
+     -F "seed=42" \
+     -F "controlnet_type=depth"
+
+# 通用Form-data方式 - 图片生成图片 (推荐)
+curl -X POST "http://localhost:12411/generate/upload" \
      -F "prompt=A beautiful landscape" \
      -F "mode=img2img" \
      -F "input_image=@input_image.png" \
      -F "strength=0.7" \
      -F "height=1024" \
-     -F "width=1024"
+     -F "width=1024" \
+     -F "num_inference_steps=50" \
+     -F "cfg=3.5" \
+     -F "seed=42" \
+     -F "controlnet_type=depth"
 
-# Form-data方式 - 填充/修复
-curl -X POST "http://localhost:12411/generate/img2img" \
+# 通用Form-data方式 - 填充/修复
+curl -X POST "http://localhost:12411/generate/upload" \
      -F "prompt=A beautiful flower garden" \
      -F "mode=fill" \
      -F "input_image=@input_image.png" \
      -F "mask_image=@mask_image.png" \
      -F "height=1024" \
-     -F "width=1024"
+     -F "width=1024" \
+     -F "controlnet_type=depth"
+
+# 通用Form-data方式 - ControlNet
+curl -X POST "http://localhost:12411/generate/upload" \
+     -F "prompt=A futuristic city with skyscrapers" \
+     -F "mode=controlnet" \
+     -F "controlnet_type=canny" \
+     -F "input_image=@input_image.png" \
+     -F "control_image=@canny_edges.png" \
+     -F "height=1024" \
+     -F "width=1024" \
+     -F "num_inference_steps=50" \
+     -F "cfg=3.5" \
+     -F "seed=42"
 ```
 
 ## 图片格式要求
@@ -348,9 +515,17 @@ curl -X POST "http://localhost:12411/generate/img2img" \
 ## 性能优化建议
 
 ### 1. 上传方式选择
+- **推荐使用Form-data**: 所有图片上传都推荐使用 `/generate/upload` 端点
 - **小图片 (< 512x512)**: 可以使用JSON方式，简单方便
-- **大图片 (≥ 1024x1024)**: 推荐使用Form-data方式，性能更好
+- **大图片 (≥ 1024x1024)**: 强烈推荐使用Form-data方式，性能更好
 - **批量处理**: 使用Form-data方式，减少内存占用
+- **移动端应用**: 使用Form-data方式，减少网络传输开销
+
+**Form-data优势**:
+- 更快的上传速度（减少33%的数据大小）
+- 更低的内存占用
+- 更好的网络传输效率
+- 支持所有生成模式（text2img、img2img、fill、controlnet）
 
 ### 2. 参数调优
 - **num_inference_steps**: 减少步数可提高速度，但可能影响质量
@@ -408,13 +583,181 @@ python test_img2img.py fill
 python test_img2img.py controlnet
 ```
 
+### 5. 通用Form-data功能测试
+```bash
+# 测试所有通用Form-data功能
+python test_general_upload.py
+
+# 测试特定模式
+python test_general_upload.py text2img
+python test_general_upload.py img2img
+python test_general_upload.py fill
+python test_general_upload.py controlnet
+
+# 测试参数验证
+python test_general_upload.py validation
+
+# 测试新旧端点对比
+python test_general_upload.py comparison
+```
+
+### 6. ControlNet功能测试
+```bash
+# 测试所有ControlNet功能
+python test_controlnet.py
+
+# 测试特定ControlNet类型
+python test_controlnet.py depth
+python test_controlnet.py canny
+python test_controlnet.py openpose
+
+# 测试参数验证
+python test_controlnet.py validation
+python test_controlnet.py invalid
+```
+
 ## 注意事项
 
 1. **模型支持**: 确保已下载相应的Flux模型文件
 2. **GPU内存**: 大尺寸图片需要更多GPU内存
 3. **并发限制**: 每个GPU进程同时只能处理一个任务
 4. **上传方式**: 
+   - **推荐使用Form-data**: 所有图片上传都推荐使用 `/generate/upload` 端点
    - Base64会增加约33%的数据大小
    - Form-data直接传输二进制数据，性能更好
+   - Form-data支持所有生成模式（text2img、img2img、fill、controlnet）
 5. **网络传输**: 大图片的传输可能需要较长时间
-6. **文件大小限制**: 建议单个图片文件不超过50MB 
+6. **文件大小限制**: 建议单个图片文件不超过50MB
+7. **端点选择**:
+   - `/generate/upload`: 通用Form-data端点，推荐使用
+   - `/generate/img2img`: 向后兼容端点，功能相同
+   - `/generate`: JSON端点，适合简单测试
+
+### ControlNet模式参数
+
+| 参数名 | 类型 | 必需 | 默认值 | 说明 |
+|--------|------|------|--------|------|
+| `controlnet_type` | string | 是 | "depth" | ControlNet类型，支持：`depth`、`canny`、`openpose` |
+
+#### ControlNet类型说明
+
+- **depth**: 深度控制，使用深度图控制生成图片的空间结构
+- **canny**: 边缘控制，使用Canny边缘检测图控制生成图片的轮廓
+- **openpose**: 姿态控制，使用人体姿态图控制生成图片中的人物姿态
+
+#### ControlNet请求示例
+
+```bash
+# JSON方式 - Depth ControlNet
+curl -X POST "http://localhost:12411/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A beautiful landscape with mountains",
+    "mode": "controlnet",
+    "controlnet_type": "depth",
+    "input_image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+    "control_image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+    "height": 1024,
+    "width": 1024,
+    "num_inference_steps": 50,
+    "cfg": 3.5,
+    "seed": 42
+  }'
+
+# Form-data方式 - Canny ControlNet
+curl -X POST "http://localhost:12411/generate/img2img" \
+  -F "prompt=A futuristic city with skyscrapers" \
+  -F "mode=controlnet" \
+  -F "controlnet_type=canny" \
+  -F "input_image=@input.jpg" \
+  -F "control_image=@canny_edges.jpg" \
+  -F "height=1024" \
+  -F "width=1024" \
+  -F "num_inference_steps=50" \
+  -F "cfg=3.5" \
+  -F "seed=42"
+```
+
+#### ControlNet响应示例
+
+```json
+{
+  "success": true,
+  "task_id": "550e8400-e29b-41d4-a716-446655440000",
+  "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+  "elapsed_time": 15.23,
+  "gpu_id": "0",
+  "model_id": "flux1-dev",
+  "mode": "controlnet",
+  "controlnet_type": "depth"
+}
+``` 
+
+## 示例
+```
+#!/bin/bash
+
+# GenServe 文生图 API 调用示例
+# 使用 curl 命令调用 GenServe 服务生成图片
+
+echo "🎨 GenServe 文生图示例"
+echo "=========================="
+
+# 服务地址
+API_URL="http://localhost:12411"
+
+# 示例1：基础文生图
+echo "📝 示例1：基础文生图"
+curl -X POST "${API_URL}/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A beautiful sunset over mountains, vibrant colors, photorealistic",
+    "model_id": "flux1-dev",
+    "mode": "text2img",
+    "height": 1024,
+    "width": 1024,
+    "num_inference_steps": 50,
+    "cfg": 3.5,
+    "seed": 42
+  }' | jq '.'
+
+echo -e "\n================================\n"
+
+# 示例2：高质量文生图
+echo "📝 示例2：高质量文生图"
+curl -X POST "${API_URL}/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A majestic dragon flying through clouds, fantasy art, highly detailed, 8k resolution",
+    "model_id": "flux1-dev",
+    "mode": "text2img",
+    "height": 1024,
+    "width": 1024,
+    "num_inference_steps": 80,
+    "cfg": 4.0,
+    "seed": 123456
+  }' | jq '.'
+
+echo -e "\n================================\n"
+
+# 示例3：简单调用（使用默认参数）
+echo "📝 示例3：简单调用"
+curl -X POST "${API_URL}/generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A cute cat sitting on a windowsill, soft lighting",
+    "model_id": "flux1-dev"
+  }' | jq '.'
+
+echo -e "\n================================\n"
+
+# 示例4：检查服务状态
+echo "📝 检查服务状态"
+echo "支持的模型："
+curl -s "${API_URL}/models" | jq '.models[].model_id'
+
+echo -e "\n服务健康状态："
+curl -s "${API_URL}/health" | jq '.'
+
+echo -e "\n🎉 示例完成！"
+```

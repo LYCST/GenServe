@@ -15,7 +15,6 @@ import io
 
 # 导入进程级并发管理器
 from models.process_concurrent_manager import ProcessConcurrentModelManager
-from device_manager import DeviceManager
 from config import Config
 
 # 配置日志
@@ -27,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 # 全局变量
 concurrent_manager: Optional[ProcessConcurrentModelManager] = None
-device_manager = DeviceManager()
 
 # 请求模型 - 用于JSON请求
 class GenerateRequest(BaseModel):
@@ -44,16 +42,18 @@ class GenerateRequest(BaseModel):
     input_image: Optional[str] = None  # base64编码的输入图片
     mask_image: Optional[str] = None  # base64编码的蒙版图片（用于fill模式）
     control_image: Optional[str] = None  # base64编码的控制图片（用于controlnet模式）
+    controlnet_type: str = "depth"  # controlnet类型：depth, canny, openpose
 
 class GenerateResponse(BaseModel):
     success: bool
-    task_id: str = ""
+    task_id: str
     image_base64: Optional[str] = None
     error: Optional[str] = None
     elapsed_time: Optional[float] = None
     gpu_id: Optional[str] = None
     model_id: Optional[str] = None
-    mode: Optional[str] = None  # 生成模式
+    mode: Optional[str] = None
+    controlnet_type: Optional[str] = None  # 添加controlnet类型到响应
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -120,7 +120,7 @@ async def root():
         "status": "running",
         "endpoints": {
             "json_base64": "POST /generate",
-            "form_data": "POST /generate/img2img"
+            "form_data": "POST /generate/upload"
         }
     }
 
@@ -131,6 +131,15 @@ async def generate_image(request: GenerateRequest):
         raise HTTPException(status_code=503, detail="服务未就绪")
     
     try:
+        # 验证模型是否支持
+        supported_models_data = concurrent_manager.get_model_list()
+        supported_model_ids = [model['model_id'] for model in supported_models_data]
+        if request.model_id not in supported_model_ids:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"不支持的模型: {request.model_id}，支持的模型: {supported_model_ids}"
+            )
+        
         # 验证参数
         if not Config.validate_prompt(request.prompt):
             raise HTTPException(status_code=400, detail="提示词长度超出限制")
@@ -146,6 +155,12 @@ async def generate_image(request: GenerateRequest):
         elif request.mode == "controlnet" and (not request.input_image or not request.control_image):
             raise HTTPException(status_code=400, detail="controlnet模式需要提供input_image和control_image")
         
+        # 验证controlnet类型
+        if request.mode == "controlnet":
+            valid_controlnet_types = ["depth", "canny", "openpose"]
+            if request.controlnet_type.lower() not in valid_controlnet_types:
+                raise HTTPException(status_code=400, detail=f"不支持的controlnet类型: {request.controlnet_type}，支持的类型: {valid_controlnet_types}")
+        
         # 调用进程级并发管理器
         result = await concurrent_manager.generate_image_async(
             model_id=request.model_id,
@@ -160,7 +175,8 @@ async def generate_image(request: GenerateRequest):
             strength=request.strength,
             input_image=request.input_image,
             mask_image=request.mask_image,
-            control_image=request.control_image
+            control_image=request.control_image,
+            controlnet_type=request.controlnet_type
         )
         
         # 构建响应
@@ -172,7 +188,8 @@ async def generate_image(request: GenerateRequest):
             elapsed_time=result.get("elapsed_time"),
             gpu_id=result.get("gpu_id"),
             model_id=result.get("model_id"),
-            mode=request.mode
+            mode=request.mode,
+            controlnet_type=request.controlnet_type
         )
         
         return response
@@ -181,8 +198,8 @@ async def generate_image(request: GenerateRequest):
         logger.error(f"生成图片时出错: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/generate/img2img", response_model=GenerateResponse)
-async def generate_image_upload(
+@app.post("/generate/upload", response_model=GenerateResponse)
+async def generate_image_upload_general(
     prompt: str = Form(...),
     model_id: str = Form("flux1-dev"),
     height: int = Form(1024),
@@ -195,19 +212,35 @@ async def generate_image_upload(
     strength: float = Form(0.8),
     input_image: Optional[UploadFile] = File(None),
     mask_image: Optional[UploadFile] = File(None),
-    control_image: Optional[UploadFile] = File(None)
+    control_image: Optional[UploadFile] = File(None),
+    controlnet_type: str = Form("depth")
 ):
-    """生成图片 - Form-data格式，支持文件上传"""
+    """生成图片 - 通用Form-data格式，支持所有模式的文件上传"""
     if not concurrent_manager:
         raise HTTPException(status_code=503, detail="服务未就绪")
     
     try:
+        # 验证模型是否支持
+        supported_models_data = concurrent_manager.get_model_list()
+        supported_model_ids = [model['model_id'] for model in supported_models_data]
+        if model_id not in supported_model_ids:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"不支持的模型: {model_id}，支持的模型: {supported_model_ids}"
+            )
+        
         # 验证参数
         if not Config.validate_prompt(prompt):
             raise HTTPException(status_code=400, detail="提示词长度超出限制")
         
         if not Config.validate_image_size(height, width):
             raise HTTPException(status_code=400, detail="图片尺寸超出限制")
+        
+        # 验证controlnet类型
+        if mode == "controlnet":
+            valid_controlnet_types = ["depth", "canny", "openpose"]
+            if controlnet_type.lower() not in valid_controlnet_types:
+                raise HTTPException(status_code=400, detail=f"不支持的controlnet类型: {controlnet_type}，支持的类型: {valid_controlnet_types}")
         
         # 处理上传的文件
         input_image_base64 = None
@@ -245,7 +278,8 @@ async def generate_image_upload(
             strength=strength,
             input_image=input_image_base64,
             mask_image=mask_image_base64,
-            control_image=control_image_base64
+            control_image=control_image_base64,
+            controlnet_type=controlnet_type
         )
         
         # 构建响应
@@ -257,7 +291,8 @@ async def generate_image_upload(
             elapsed_time=result.get("elapsed_time"),
             gpu_id=result.get("gpu_id"),
             model_id=result.get("model_id"),
-            mode=mode
+            mode=mode,
+            controlnet_type=controlnet_type
         )
         
         return response
@@ -276,14 +311,8 @@ async def get_status():
         # 获取并发管理器状态
         concurrent_status = concurrent_manager.get_status()
         
-        # 获取设备信息
-        device_info = device_manager.get_available_devices()
-        gpu_load = device_manager.get_device_usage()
-        
         return {
-            "concurrent_manager": concurrent_status,
-            "device_info": device_info,
-            "gpu_load": gpu_load
+            "concurrent_manager": concurrent_status
         }
         
     except Exception as e:

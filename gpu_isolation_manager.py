@@ -72,17 +72,26 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         
-        # 初始化pipeline字典
+        # 根据模型ID确定实际的模型路径
+        from config import Config
+        model_paths = Config.get_model_paths()
+        actual_model_path = model_paths.get(model_id, model_path)
+        
+        logger.info(f"GPU {gpu_id} 使用模型路径: {actual_model_path}")
+        
+        # 初始化pipeline字典 - 支持多种controlnet类型
         pipelines = {
             "text2img": None,
             "img2img": None,
             "fill": None,
-            "controlnet": None
+            "controlnet_depth": None,
+            "controlnet_canny": None,
+            "controlnet_openpose": None
         }
         
         # 加载基础text2img pipeline
         pipelines["text2img"] = FluxPipeline.from_pretrained(
-            model_path,
+            actual_model_path,
             torch_dtype=torch.bfloat16,
             use_safetensors=True,
             local_files_only=True
@@ -99,7 +108,6 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
             try:
                 # 定期内存清理
                 current_time = time.time()
-                from config import Config
                 if current_time - last_cleanup_time > Config.GPU_MEMORY_CLEANUP_INTERVAL:
                     if torch.cuda.is_available():
                         allocated = torch.cuda.memory_allocated() / 1024**2
@@ -132,7 +140,7 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
                         gc.collect()
                 
                 # 处理任务
-                result = process_generation_task(pipelines, task, gpu_id, load_image_from_base64, model_path)
+                result = process_generation_task(pipelines, task, gpu_id, load_image_from_base64, actual_model_path)
                 result_queue.put(result)
                 
                 success = result.get('success', False)
@@ -271,9 +279,15 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
         logger.info(f"GPU {gpu_id} 开始生成任务: {task.get('task_id', 'unknown')}")
         generator = torch.Generator("cpu").manual_seed(task.get('seed', 42))
         
-        # 获取生成模式
+        # 获取生成模式和模型ID
         mode = task.get('mode', 'text2img')
-        logger.info(f"GPU {gpu_id} 使用模式: {mode}")
+        model_id = task.get('model_id', 'flux1-dev')
+        logger.info(f"GPU {gpu_id} 使用模式: {mode}, 模型: {model_id}")
+        
+        # 根据模型ID确定实际的模型路径
+        from config import Config
+        model_paths = Config.get_model_paths()
+        actual_model_path = model_paths.get(model_id, model_path)
         
         # 根据模式选择或加载pipeline
         if mode == 'text2img':
@@ -282,7 +296,7 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
             if pipelines["img2img"] is None:
                 logger.info(f"GPU {gpu_id} 加载img2img pipeline...")
                 pipelines["img2img"] = FluxImg2ImgPipeline.from_pretrained(
-                    model_path,
+                    actual_model_path,
                     torch_dtype=torch.bfloat16,
                     use_safetensors=True,
                     local_files_only=True
@@ -294,7 +308,7 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
             if pipelines["fill"] is None:
                 logger.info(f"GPU {gpu_id} 加载fill pipeline...")
                 pipelines["fill"] = FluxFillPipeline.from_pretrained(
-                    model_path,
+                    actual_model_path,
                     torch_dtype=torch.bfloat16,
                     use_safetensors=True,
                     local_files_only=True
@@ -303,30 +317,50 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                 logger.info(f"GPU {gpu_id} fill pipeline加载完成")
             pipe = pipelines["fill"]
         elif mode == 'controlnet':
-            if pipelines["controlnet"] is None:
-                logger.info(f"GPU {gpu_id} 加载controlnet pipeline...")
-                # 使用专门的controlnet模型路径
-                controlnet_model_path = os.path.join(os.path.dirname(model_path), "flux1-depth-dev")
+            # 获取controlnet类型
+            controlnet_type = task.get('controlnet_type', 'depth').lower()
+            pipeline_key = f"controlnet_{controlnet_type}"
+            
+            if pipeline_key not in pipelines:
+                raise ValueError(f"不支持的controlnet类型: {controlnet_type}")
+            
+            if pipelines[pipeline_key] is None:
+                logger.info(f"GPU {gpu_id} 加载{controlnet_type} controlnet pipeline...")
+                
+                # 根据类型选择模型路径
+                model_paths = Config.get_model_paths()
+                if controlnet_type == 'depth':
+                    controlnet_model_path = model_paths.get("flux1-depth-dev", actual_model_path)
+                elif controlnet_type == 'canny':
+                    controlnet_model_path = model_paths.get("flux1-canny-dev", actual_model_path)
+                elif controlnet_type == 'openpose':
+                    controlnet_model_path = model_paths.get("flux1-openpose-dev", actual_model_path)
+                else:
+                    raise ValueError(f"不支持的controlnet类型: {controlnet_type}")
+                
                 if not os.path.exists(controlnet_model_path):
                     # 如果专用路径不存在，使用基础路径
-                    controlnet_model_path = model_path
-                    logger.warning(f"GPU {gpu_id} 专用controlnet模型路径不存在，使用基础模型: {controlnet_model_path}")
+                    controlnet_model_path = actual_model_path
+                    logger.warning(f"GPU {gpu_id} 专用{controlnet_type} controlnet模型路径不存在，使用基础模型: {controlnet_model_path}")
+                else:
+                    logger.info(f"GPU {gpu_id} 使用{controlnet_type} controlnet模型路径: {controlnet_model_path}")
                 
                 try:
-                    pipelines["controlnet"] = FluxControlPipeline.from_pretrained(
+                    pipelines[pipeline_key] = FluxControlPipeline.from_pretrained(
                         controlnet_model_path,
                         torch_dtype=torch.bfloat16,
                         use_safetensors=True,
                         local_files_only=True
                     )
-                    pipelines["controlnet"].enable_model_cpu_offload(device="cuda:0")
-                    logger.info(f"GPU {gpu_id} controlnet pipeline加载完成")
+                    pipelines[pipeline_key].enable_model_cpu_offload(device="cuda:0")
+                    logger.info(f"GPU {gpu_id} {controlnet_type} controlnet pipeline加载完成")
                 except Exception as e:
-                    logger.error(f"GPU {gpu_id} 加载controlnet pipeline失败: {e}")
+                    logger.error(f"GPU {gpu_id} 加载{controlnet_type} controlnet pipeline失败: {e}")
                     # 如果controlnet加载失败，回退到基础pipeline
                     logger.info(f"GPU {gpu_id} 回退到基础pipeline")
-                    pipelines["controlnet"] = pipelines["text2img"]
-            pipe = pipelines["controlnet"]
+                    pipelines[pipeline_key] = pipelines["text2img"]
+            
+            pipe = pipelines[pipeline_key]
         else:
             raise ValueError(f"不支持的生成模式: {mode}")
         
@@ -371,6 +405,8 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
             elif mode == 'controlnet':
                 # 加载控制图片
                 control_image = load_image_func(task.get('control_image'))
+                controlnet_type = task.get('controlnet_type', 'depth')
+                
                 result = pipe(
                     prompt=task['prompt'],
                     control_image=control_image,
@@ -418,7 +454,8 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
             "task_id": task.get('task_id'),
             "save_to_disk": save_to_disk,
             "params": task,
-            "mode": mode
+            "mode": mode,
+            "controlnet_type": task.get('controlnet_type') if mode == 'controlnet' else None
         }
     except Exception as e:
         elapsed_time = time.time() - start_time
@@ -438,7 +475,8 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
             "elapsed_time": elapsed_time,
             "gpu_id": gpu_id,
             "task_id": task.get('task_id'),
-            "mode": mode
+            "mode": mode,
+            "controlnet_type": task.get('controlnet_type') if mode == 'controlnet' else None
         }
 
 class GPUIsolationManager:
@@ -693,7 +731,9 @@ if __name__ == "__main__":
     
     # 创建GPU进程
     gpu_ids = ["0", "1", "2", "3"]
-    model_path = "/home/shuzuan/prj/models/flux1-dev"
+    from config import Config
+    model_paths = Config.get_model_paths()
+    model_path = model_paths.get("flux1-dev", "/path/to/flux1-dev")
     
     for gpu_id in gpu_ids:
         manager.create_gpu_process(gpu_id, model_path, "flux1-dev")

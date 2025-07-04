@@ -3,7 +3,7 @@ from typing import Dict, Any, Optional
 from PIL import Image
 import logging
 import torch
-from device_manager import DeviceManager
+from config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ class BaseModel(ABC):
         
         # 设置GPU设备
         if gpu_device is not None:
-            if DeviceManager.validate_device(gpu_device):
+            if Config.validate_gpu_device(gpu_device):
                 self.gpu_device = gpu_device
             else:
                 logger.warning(f"无效的GPU设备 {gpu_device}，使用默认设备")
@@ -35,7 +35,10 @@ class BaseModel(ABC):
     
     def _select_best_gpu(self) -> str:
         """为当前模型选择最佳GPU"""
-        return DeviceManager.select_best_gpu_for_model(self.model_id)
+        available_gpus = Config.get_model_gpu_config_static(self.model_id)
+        if available_gpus and available_gpus[0] != "cpu":
+            return available_gpus[0]
+        return "cpu"
     
     @abstractmethod
     def load(self) -> bool:
@@ -66,7 +69,7 @@ class BaseModel(ABC):
             "is_loaded": self.is_loaded,
             "supported_features": self.get_supported_features(),
             "device": self.gpu_device,
-            "available_gpus": DeviceManager.get_gpu_load_info(),
+            "available_gpus": Config.get_gpu_load_info(),
             "gpu_memory": self._get_gpu_memory_info() if self.gpu_device != "cpu" else None
         }
     
@@ -124,7 +127,7 @@ class BaseModel(ABC):
     
     def set_gpu_device(self, device: str) -> bool:
         """设置GPU设备"""
-        if not DeviceManager.validate_device(device):
+        if not Config.validate_gpu_device(device):
             logger.error(f"无效的GPU设备: {device}")
             return False
         

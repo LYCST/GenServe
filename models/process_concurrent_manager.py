@@ -54,7 +54,6 @@ class ProcessConcurrentModelManager:
         self.max_global_queue_size = config["concurrent"]["max_global_queue_size"]
         self.task_timeout = config["concurrent"]["task_timeout"]
         self.scheduler_sleep_time = config["concurrent"]["scheduler_sleep_time"]
-        self.load_balance_strategy = config["concurrent"]["load_balance_strategy"]
         
         # 统计信息
         self.stats = {
@@ -73,13 +72,18 @@ class ProcessConcurrentModelManager:
         model_paths = Config.get_config()["model_management"]["model_paths"]
         
         for model_id, gpu_list in model_gpu_config.items():
+            # 检查模型路径是否配置
+            model_path = model_paths.get(model_id)
+            if not model_path:
+                logger.warning(f"⚠️ 模型 {model_id} 未配置路径，跳过")
+                continue
+            
+            if not os.path.exists(model_path):
+                logger.warning(f"⚠️ 模型 {model_id} 路径不存在: {model_path}，跳过")
+                continue
+            
             if model_id not in self.model_instances:
                 self.model_instances[model_id] = []
-            
-            model_path = model_paths.get(model_id, "")
-            if not model_path or not os.path.exists(model_path):
-                logger.error(f"模型路径不存在: {model_path}")
-                continue
             
             # 为每个GPU创建隔离进程
             for gpu_device in gpu_list:
@@ -89,13 +93,17 @@ class ProcessConcurrentModelManager:
                     # 创建GPU隔离进程
                     if self.gpu_manager.create_gpu_process(gpu_id, model_path, model_id):
                         self.model_instances[model_id].append(gpu_id)
-                        logger.info(f"✅ GPU {gpu_id} 进程创建成功")
+                        logger.info(f"✅ GPU {gpu_id} 进程创建成功 (模型: {model_id})")
                     else:
-                        logger.error(f"❌ GPU {gpu_id} 进程创建失败")
+                        logger.error(f"❌ GPU {gpu_id} 进程创建失败 (模型: {model_id})")
         
         # 打印初始化结果
         total_processes = sum(len(gpus) for gpus in self.model_instances.values())
+        supported_models = list(self.model_instances.keys())
+        
         logger.info(f"🎉 模型进程初始化完成，总共创建了 {total_processes} 个GPU进程")
+        logger.info(f"📋 支持的模型: {supported_models}")
+        
         for model_id, gpus in self.model_instances.items():
             logger.info(f"  {model_id}: {len(gpus)} 个GPU进程 ({gpus})")
     
@@ -226,7 +234,8 @@ class ProcessConcurrentModelManager:
                 "strength": task.params.get('strength', 0.8),
                 "input_image": task.params.get('input_image'),
                 "mask_image": task.params.get('mask_image'),
-                "control_image": task.params.get('control_image')
+                "control_image": task.params.get('control_image'),
+                "controlnet_type": task.params.get('controlnet_type', 'depth')
             }
             
             # 提交任务到GPU进程
@@ -292,7 +301,8 @@ class ProcessConcurrentModelManager:
         strength: float = 0.8,
         input_image: Optional[str] = None,
         mask_image: Optional[str] = None,
-        control_image: Optional[str] = None
+        control_image: Optional[str] = None,
+        controlnet_type: str = "depth"
     ) -> Dict[str, Any]:
         """异步生成图片 - 支持图生图"""
         if not self.is_running:
@@ -314,6 +324,18 @@ class ProcessConcurrentModelManager:
                 "model_id": model_id
             }
         
+        # 验证controlnet类型
+        if mode == "controlnet":
+            valid_controlnet_types = ["depth", "canny", "openpose"]
+            if controlnet_type.lower() not in valid_controlnet_types:
+                return {
+                    "success": False,
+                    "error": f"不支持的controlnet类型: {controlnet_type}，支持的类型: {valid_controlnet_types}",
+                    "task_id": "",
+                    "gpu_id": None,
+                    "model_id": model_id
+                }
+        
         # 创建任务
         task_id = str(uuid.uuid4())
         result_queue = Queue()
@@ -329,7 +351,8 @@ class ProcessConcurrentModelManager:
             "strength": strength,
             "input_image": input_image,
             "mask_image": mask_image,
-            "control_image": control_image
+            "control_image": control_image,
+            "controlnet_type": controlnet_type.lower()
         }
         
         task = GenerationTask(
@@ -342,7 +365,7 @@ class ProcessConcurrentModelManager:
             priority=priority
         )
         
-        logger.info(f"提交{mode}任务: {task_id}, 模型: {model_id}, 优先级: {priority}")
+        logger.info(f"提交{mode}任务: {task_id}, 模型: {model_id}, 优先级: {priority}, controlnet类型: {controlnet_type if mode == 'controlnet' else 'N/A'}")
         
         # 提交到全局队列
         try:
@@ -367,6 +390,8 @@ class ProcessConcurrentModelManager:
             result["task_id"] = task_id
             result["model_id"] = model_id
             result["mode"] = mode
+            if mode == "controlnet":
+                result["controlnet_type"] = controlnet_type
             
             return result
             
@@ -413,7 +438,6 @@ class ProcessConcurrentModelManager:
             "dead_processes": dead_processes,
             "total_restarts": total_restarts,
             "max_restarts_reached": max_restarts_reached,
-            "load_balance_strategy": self.load_balance_strategy,
             "task_timeout": self.task_timeout,
             "stats": self.stats.copy(),
             "model_instances": {
