@@ -40,8 +40,8 @@ export FLUX_MODEL_PATH="/home/shuzuan/prj/models/flux1-dev"
 # Depth控制模型路径 (可选，如果不配置则跳过该模型)
 # export FLUX_DEPTH_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Depth-dev"
 
-# Fill填充模型路径 (可选，如果不配置则跳过该模型)
-# export FLUX_FILL_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Fill-dev"
+#Fill填充模型路径 (可选，如果不配置则跳过该模型)
+export FLUX_FILL_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Fill-dev"
 
 # Canny边缘控制模型路径 (可选，如果不配置则跳过该模型)
 # export FLUX_CANNY_MODEL_PATH="/home/shuzuan/prj/models/flux1-canny-dev"
@@ -60,7 +60,7 @@ export FLUX_GPUS="0,1"
 # export FLUX_DEPTH_GPUS="2"
 
 # Fill模型GPU分配 (使用GPU 3，如果不配置则使用基础模型的GPU)
-# export FLUX_FILL_GPUS="3"
+export FLUX_FILL_GPUS="3,4"
 
 # Canny模型GPU分配 (使用GPU 0和2，如果不配置则使用基础模型的GPU)
 # export FLUX_CANNY_GPUS="0,2"

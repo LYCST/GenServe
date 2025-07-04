@@ -289,32 +289,87 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
         model_paths = Config.get_model_paths()
         actual_model_path = model_paths.get(model_id, model_path)
         
+        # 通用尺寸处理逻辑
+        def get_output_dimensions(input_image, mode):
+            """获取输出尺寸：优先使用用户指定，否则使用图片原始尺寸"""
+            user_height = task.get('height')
+            user_width = task.get('width')
+            original_width, original_height = input_image.size  # PIL返回(width, height)
+            
+            # 检查是否用户明确指定了尺寸（不是默认值）
+            if user_height == 1024 and user_width == 1024 and mode != 'text2img':
+                height = original_height
+                width = original_width
+                logger.info(f"GPU {gpu_id} 使用图片原始尺寸: {width}x{height}")
+            else:
+                height = user_height
+                width = user_width
+                logger.info(f"GPU {gpu_id} 使用用户指定尺寸: {width}x{height}")
+            
+            return width, height
+        
         # 根据模式选择或加载pipeline
         if mode == 'text2img':
             pipe = pipelines["text2img"]
         elif mode == 'img2img':
             if pipelines["img2img"] is None:
                 logger.info(f"GPU {gpu_id} 加载img2img pipeline...")
-                pipelines["img2img"] = FluxImg2ImgPipeline.from_pretrained(
-                    actual_model_path,
-                    torch_dtype=torch.bfloat16,
-                    use_safetensors=True,
-                    local_files_only=True
-                )
-                pipelines["img2img"].enable_model_cpu_offload(device="cuda:0")
-                logger.info(f"GPU {gpu_id} img2img pipeline加载完成")
+                
+                # 使用专门的模型路径（如果有的话）
+                model_paths = Config.get_model_paths()
+                img2img_model_path = model_paths.get("flux1-dev", actual_model_path)  # img2img使用基础模型
+                
+                if not os.path.exists(img2img_model_path):
+                    # 如果路径不存在，使用传入的路径
+                    img2img_model_path = actual_model_path
+                    logger.warning(f"GPU {gpu_id} img2img模型路径不存在，使用传入路径: {img2img_model_path}")
+                else:
+                    logger.info(f"GPU {gpu_id} 使用img2img模型路径: {img2img_model_path}")
+                
+                try:
+                    pipelines["img2img"] = FluxImg2ImgPipeline.from_pretrained(
+                        img2img_model_path,
+                        torch_dtype=torch.bfloat16,
+                        use_safetensors=True,
+                        local_files_only=True
+                    )
+                    pipelines["img2img"].enable_model_cpu_offload(device="cuda:0")
+                    logger.info(f"GPU {gpu_id} img2img pipeline加载完成")
+                except Exception as e:
+                    logger.error(f"GPU {gpu_id} 加载img2img pipeline失败: {e}")
+                    # 如果img2img加载失败，尝试使用基础pipeline
+                    logger.info(f"GPU {gpu_id} 尝试使用基础pipeline进行img2img操作")
+                    pipelines["img2img"] = pipelines["text2img"]
             pipe = pipelines["img2img"]
         elif mode == 'fill':
             if pipelines["fill"] is None:
                 logger.info(f"GPU {gpu_id} 加载fill pipeline...")
-                pipelines["fill"] = FluxFillPipeline.from_pretrained(
-                    actual_model_path,
-                    torch_dtype=torch.bfloat16,
-                    use_safetensors=True,
-                    local_files_only=True
-                )
-                pipelines["fill"].enable_model_cpu_offload(device="cuda:0")
-                logger.info(f"GPU {gpu_id} fill pipeline加载完成")
+                
+                # 使用专门的Fill模型路径
+                model_paths = Config.get_model_paths()
+                fill_model_path = model_paths.get("flux1-fill-dev", actual_model_path)
+                
+                if not os.path.exists(fill_model_path):
+                    # 如果专用Fill模型路径不存在，使用基础路径
+                    fill_model_path = actual_model_path
+                    logger.warning(f"GPU {gpu_id} 专用Fill模型路径不存在，使用基础模型: {fill_model_path}")
+                else:
+                    logger.info(f"GPU {gpu_id} 使用Fill模型路径: {fill_model_path}")
+                
+                try:
+                    pipelines["fill"] = FluxFillPipeline.from_pretrained(
+                        fill_model_path,
+                        torch_dtype=torch.bfloat16,
+                        use_safetensors=True,
+                        local_files_only=True
+                    )
+                    pipelines["fill"].enable_model_cpu_offload(device="cuda:0")
+                    logger.info(f"GPU {gpu_id} fill pipeline加载完成")
+                except Exception as e:
+                    logger.error(f"GPU {gpu_id} 加载fill pipeline失败: {e}")
+                    # 如果fill加载失败，尝试使用基础pipeline
+                    logger.info(f"GPU {gpu_id} 尝试使用基础pipeline进行fill操作")
+                    pipelines["fill"] = pipelines["text2img"]
             pipe = pipelines["fill"]
         elif mode == 'controlnet':
             # 获取controlnet类型
@@ -378,9 +433,15 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
             elif mode == 'img2img':
                 # 加载输入图片
                 input_image = load_image_func(task.get('input_image'))
+                
+                # 获取尺寸：优先使用用户指定，否则使用图片原始尺寸
+                width, height = get_output_dimensions(input_image, mode)
+                
                 result = pipe(
                     prompt=task['prompt'],
                     image=input_image,
+                    height=height,
+                    width=width,
                     strength=task.get('strength', 0.8),
                     guidance_scale=task.get('cfg', 3.5),
                     num_inference_steps=task.get('num_inference_steps', 50),
@@ -391,13 +452,18 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                 # 加载输入图片和蒙版
                 input_image = load_image_func(task.get('input_image'))
                 mask_image = load_image_func(task.get('mask_image'))
+                
+                # 获取尺寸：优先使用用户指定，否则使用图片原始尺寸
+                width, height = get_output_dimensions(input_image, mode)
+                
+                # 根据官方示例，使用原始图片尺寸
                 result = pipe(
                     prompt=task['prompt'],
                     image=input_image,
                     mask_image=mask_image,
-                    height=task.get('height', 1024),
-                    width=task.get('width', 1024),
-                    guidance_scale=task.get('cfg', 3.5),
+                    height=height,
+                    width=width,
+                    guidance_scale=30.0,  # Fill模式推荐使用30
                     num_inference_steps=task.get('num_inference_steps', 50),
                     max_sequence_length=512,
                     generator=generator
@@ -407,11 +473,14 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                 control_image = load_image_func(task.get('control_image'))
                 controlnet_type = task.get('controlnet_type', 'depth')
                 
+                # 获取尺寸：优先使用用户指定，否则使用控制图片原始尺寸
+                width, height = get_output_dimensions(control_image, mode)
+                
                 result = pipe(
                     prompt=task['prompt'],
                     control_image=control_image,
-                    height=task.get('height', 1024),
-                    width=task.get('width', 1024),
+                    height=height,
+                    width=width,
                     guidance_scale=task.get('cfg', 3.5),
                     num_inference_steps=task.get('num_inference_steps', 50),
                     max_sequence_length=512,
