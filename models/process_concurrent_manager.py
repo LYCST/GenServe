@@ -304,6 +304,9 @@ class ProcessConcurrentModelManager:
         mask_image: Optional[str] = None,
         control_image: Optional[str] = None,
         controlnet_type: str = "depth",
+        controlnet_conditioning_scale: Optional[float] = None,
+        control_guidance_start: Optional[float] = None,
+        control_guidance_end: Optional[float] = None,
         loras: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """异步生成图片 - 支持图生图"""
@@ -355,6 +358,9 @@ class ProcessConcurrentModelManager:
             "mask_image": mask_image,
             "control_image": control_image,
             "controlnet_type": controlnet_type.lower(),
+            "controlnet_conditioning_scale": controlnet_conditioning_scale,
+            "control_guidance_start": control_guidance_start,
+            "control_guidance_end": control_guidance_end,
             "loras": loras
         }
         

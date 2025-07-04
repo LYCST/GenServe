@@ -44,6 +44,9 @@ class GenerateRequest(BaseModel):
     mask_image: Optional[str] = None  # base64编码的蒙版图片（用于fill模式）
     control_image: Optional[str] = None  # base64编码的控制图片（用于controlnet模式）
     controlnet_type: str = "depth"  # controlnet类型：depth, canny, openpose
+    controlnet_conditioning_scale: Optional[float] = None  # ControlNet条件强度，控制深度图影响程度
+    control_guidance_start: Optional[float] = None  # ControlNet开始作用点（0-1），控制何时开始应用深度图
+    control_guidance_end: Optional[float] = None  # ControlNet结束作用点（0-1），控制何时停止应用深度图
     loras: Optional[List[Dict[str, Any]]] = None  # LoRA列表，每个LoRA包含name和weight
 
 class GenerateResponse(BaseModel):
@@ -206,6 +209,9 @@ async def generate_image(request: GenerateRequest):
             mask_image=request.mask_image,
             control_image=request.control_image,
             controlnet_type=request.controlnet_type,
+            controlnet_conditioning_scale=request.controlnet_conditioning_scale,
+            control_guidance_start=request.control_guidance_start,
+            control_guidance_end=request.control_guidance_end,
             loras=request.loras
         )
         
@@ -244,6 +250,9 @@ async def generate_image_upload_general(
     mask_image: Optional[UploadFile] = File(None),
     control_image: Optional[UploadFile] = File(None),
     controlnet_type: str = Form("depth"),
+    controlnet_conditioning_scale: Optional[float] = Form(None),  # ControlNet条件强度
+    control_guidance_start: Optional[float] = Form(None),  # ControlNet开始作用点
+    control_guidance_end: Optional[float] = Form(None),  # ControlNet结束作用点
     loras: Optional[str] = Form(None)  # JSON字符串格式的LoRA列表
 ):
     """生成图片 - 通用Form-data格式，支持所有模式的文件上传"""
@@ -346,6 +355,9 @@ async def generate_image_upload_general(
             mask_image=mask_image_base64,
             control_image=control_image_base64,
             controlnet_type=controlnet_type,
+            controlnet_conditioning_scale=controlnet_conditioning_scale,
+            control_guidance_start=control_guidance_start,
+            control_guidance_end=control_guidance_end,
             loras=loras_list
         )
         

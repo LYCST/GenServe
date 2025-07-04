@@ -327,7 +327,7 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
         
         # 通用尺寸处理逻辑
         def get_output_dimensions(input_image, mode):
-            """获取输出尺寸：优先使用用户指定，否则使用图片原始尺寸"""
+            """获取输出尺寸：优先使用用户指定，否则使用图片原始尺寸，并确保是16的倍数"""
             user_height = task.get('height')
             user_width = task.get('width')
             original_width, original_height = input_image.size  # PIL返回(width, height)
@@ -341,6 +341,23 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                 height = user_height
                 width = user_width
                 logger.info(f"GPU {gpu_id} 使用用户指定尺寸: {width}x{height}")
+            
+            # 确保尺寸是16的倍数（ControlNet要求）
+            if mode == 'controlnet':
+                # Flux ControlNet对尺寸有特殊要求
+                # 使用标准尺寸：512x512, 768x768, 1024x1024
+                # 避免使用非标准尺寸，可能导致latent packing错误
+                
+                # 计算最接近的标准尺寸
+                target_size = max(width, height)
+                if target_size <= 512:
+                    width = height = 512
+                elif target_size <= 768:
+                    width = height = 768
+                else:
+                    width = height = 1024
+                
+                logger.info(f"GPU {gpu_id} ControlNet使用标准尺寸: {width}x{height}")
             
             return width, height
         
@@ -574,16 +591,33 @@ def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model
                 # 获取尺寸：优先使用用户指定，否则使用控制图片原始尺寸
                 width, height = get_output_dimensions(control_image, mode)
                 
-                result = pipe(
-                    prompt=task['prompt'],
-                    control_image=control_image,
-                    height=height,
-                    width=width,
-                    guidance_scale=task.get('cfg', 10.0),  # controlnet推荐使用10.0
-                    num_inference_steps=task.get('num_inference_steps', 30),  # controlnet推荐使用30步
-                    max_sequence_length=512,
-                    generator=generator
-                )
+                # 如果同时提供了input_image，记录但不使用（ControlNet模式主要使用control_image）
+                if task.get('input_image'):
+                    logger.info(f"GPU {gpu_id} ControlNet模式检测到input_image，但主要使用control_image")
+                
+                # 构建ControlNet调用参数 - FluxControlPipeline只支持基本参数
+                controlnet_kwargs = {
+                    'prompt': task['prompt'],
+                    'control_image': control_image,
+                    'height': height,
+                    'width': width,
+                    'guidance_scale': task.get('cfg', 10.0),  # controlnet推荐使用10.0
+                    'num_inference_steps': task.get('num_inference_steps', 30),  # controlnet推荐使用30步
+                    'max_sequence_length': 512,
+                    'generator': generator
+                }
+                
+                # 记录用户提供的ControlNet强度控制参数（但不使用，因为FluxControlPipeline不支持）
+                if task.get('controlnet_conditioning_scale') is not None:
+                    logger.info(f"GPU {gpu_id} 用户提供了controlnet_conditioning_scale: {task.get('controlnet_conditioning_scale')}，但FluxControlPipeline不支持此参数")
+                
+                if task.get('control_guidance_start') is not None:
+                    logger.info(f"GPU {gpu_id} 用户提供了control_guidance_start: {task.get('control_guidance_start')}，但FluxControlPipeline不支持此参数")
+                
+                if task.get('control_guidance_end') is not None:
+                    logger.info(f"GPU {gpu_id} 用户提供了control_guidance_end: {task.get('control_guidance_end')}，但FluxControlPipeline不支持此参数")
+                
+                result = pipe(**controlnet_kwargs)
             else:
                 raise ValueError(f"不支持的生成模式: {mode}")
         

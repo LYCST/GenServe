@@ -41,7 +41,7 @@ export FLUX_MODEL_PATH="/home/shuzuan/prj/models/flux1-dev"
 export LORA_BASE_PATH="/home/shuzuan/prj/models/loras"
 
 # Depth控制模型路径 (可选，如果不配置则跳过该模型)
-# export FLUX_DEPTH_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Depth-dev"
+export FLUX_DEPTH_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Depth-dev"
 
 #Fill填充模型路径 (可选，如果不配置则跳过该模型)
 export FLUX_FILL_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Fill-dev"
@@ -60,7 +60,7 @@ export FLUX_FILL_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Fill-dev"
 export FLUX_GPUS="0,1"
 
 # Depth模型GPU分配 (使用GPU 2，如果不配置则使用基础模型的GPU)
-# export FLUX_DEPTH_GPUS="2"
+export FLUX_DEPTH_GPUS="5,6"
 
 # Fill模型GPU分配 (使用GPU 3，如果不配置则使用基础模型的GPU)
 export FLUX_FILL_GPUS="3,4"
