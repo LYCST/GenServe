@@ -17,6 +17,7 @@ import json
 # 导入进程级并发管理器
 from models.process_concurrent_manager import ProcessConcurrentModelManager
 from config import Config
+from utils import ValidationUtils, ResponseUtils, GenerateResponse, TaskUtils
 
 # 配置日志
 logging.basicConfig(
@@ -48,17 +49,6 @@ class GenerateRequest(BaseModel):
     control_guidance_start: Optional[float] = None  # ControlNet开始作用点（0-1），控制何时开始应用深度图
     control_guidance_end: Optional[float] = None  # ControlNet结束作用点（0-1），控制何时停止应用深度图
     loras: Optional[List[Dict[str, Any]]] = None  # LoRA配置列表
-
-class GenerateResponse(BaseModel):
-    success: bool
-    task_id: str
-    image_base64: Optional[str] = None
-    error: Optional[str] = None
-    elapsed_time: Optional[float] = None
-    gpu_id: Optional[str] = None
-    model_id: Optional[str] = None
-    mode: Optional[str] = None
-    controlnet_type: Optional[str] = None  # 添加controlnet类型到响应
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -111,9 +101,13 @@ async def file_to_base64(file: UploadFile) -> str:
     """将上传的文件转换为base64"""
     try:
         content = await file.read()
-        return base64.b64encode(content).decode()
+        base64_content = base64.b64encode(content).decode()
+        return base64_content
     except Exception as e:
         logger.error(f"文件转base64失败: {e}")
+        logger.error(f"文件信息: filename={file.filename}, content_type={file.content_type}")
+        import traceback
+        logger.error(f"错误详情: {traceback.format_exc()}")
         raise HTTPException(status_code=400, detail=f"文件处理失败: {str(e)}")
 
 @app.get("/")
@@ -136,66 +130,28 @@ async def generate_image(request: GenerateRequest):
         raise HTTPException(status_code=503, detail="服务未就绪")
     
     try:
-        # 验证模型是否支持
+        logger.info(f"收到请求: {request.model_id}")
+        # 获取支持的模型列表
         supported_models_data = concurrent_manager.get_model_list()
         supported_model_ids = [model['model_id'] for model in supported_models_data]
-        if request.model_id not in supported_model_ids:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"不支持的模型: {request.model_id}，支持的模型: {supported_model_ids}"
-            )
         
-        # 验证参数
-        if not Config.validate_prompt(request.prompt):
-            raise HTTPException(status_code=400, detail="提示词长度超出限制")
-        
-        if not Config.validate_image_size(request.height, request.width):
-            raise HTTPException(status_code=400, detail="图片尺寸超出限制")
-        
-        # 验证模式特定参数
-        if request.mode == "img2img" and not request.input_image:
-            raise HTTPException(status_code=400, detail="img2img模式需要提供input_image")
-        elif request.mode == "fill" and (not request.input_image or not request.mask_image):
-            raise HTTPException(status_code=400, detail="fill模式需要提供input_image和mask_image")
-        elif request.mode == "controlnet" and not request.control_image:
-            raise HTTPException(status_code=400, detail="controlnet模式需要提供control_image")
-        elif request.mode == "redux" and not request.input_image:
-            raise HTTPException(status_code=400, detail="redux模式需要提供input_image")
-        
-        # 验证controlnet类型
-        if request.mode == "controlnet":
-            valid_controlnet_types = ["depth", "canny", "openpose"]
-            if request.controlnet_type.lower() not in valid_controlnet_types:
-                raise HTTPException(status_code=400, detail=f"不支持的controlnet类型: {request.controlnet_type}，支持的类型: {valid_controlnet_types}")
-        
-        # 验证LoRA参数
-        if request.loras:
-            for lora in request.loras:
-                if not isinstance(lora, dict):
-                    raise HTTPException(status_code=400, detail="每个LoRA必须是字典格式")
-                if 'name' not in lora:
-                    raise HTTPException(status_code=400, detail="每个LoRA必须包含name字段")
-                if 'weight' not in lora:
-                    raise HTTPException(status_code=400, detail="每个LoRA必须包含weight字段")
-                
-                # 验证LoRA是否存在
-                lora_path = Config.get_lora_path(lora['name'])
-                if not lora_path:
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"LoRA '{lora['name']}' 不存在，请检查 /loras 接口获取可用LoRA列表"
-                    )
-                
-                # 验证权重范围
-                weight = lora.get('weight', 1.0)
-                if not isinstance(weight, (int, float)) or weight < 0 or weight > 2:
-                    raise HTTPException(status_code=400, detail="LoRA权重必须在0-2之间")
-        
-        # 调用进程级并发管理器
-        result = await concurrent_manager.generate_image_async(
+        # 使用统一的验证工具
+        ValidationUtils.validate_generation_request(
             model_id=request.model_id,
             prompt=request.prompt,
-            priority=request.priority,
+            height=request.height,
+            width=request.width,
+            mode=request.mode,
+            controlnet_type=request.controlnet_type,
+            input_image=request.input_image,
+            mask_image=request.mask_image,
+            control_image=request.control_image,
+            loras=request.loras,
+            supported_models=supported_model_ids
+        )
+        logger.info(f"构建任务参数")
+        # 构建任务参数
+        task_params = TaskUtils.build_task_params(
             height=request.height,
             width=request.width,
             num_inference_steps=request.num_inference_steps,
@@ -212,22 +168,24 @@ async def generate_image(request: GenerateRequest):
             control_guidance_end=request.control_guidance_end,
             loras=request.loras
         )
-        
-        # 构建响应
-        response = GenerateResponse(
-            success=result.get("success", False),
-            task_id=result.get("task_id", ""),
-            image_base64=result.get("image_base64"),
-            error=result.get("error"),
-            elapsed_time=result.get("elapsed_time"),
-            gpu_id=result.get("gpu_id"),
-            model_id=result.get("model_id"),
+        logger.info(f"调用进程级并发管理器")
+        # 调用进程级并发管理器
+        result = await concurrent_manager.generate_image_async(
+            model_id=request.model_id,
+            prompt=request.prompt,
+            priority=request.priority,
+            **task_params
+        )
+        logger.info(f"构建响应")
+        # 使用统一的响应构建工具
+        return ResponseUtils.build_generation_response(
+            result=result,
             mode=request.mode,
             controlnet_type=request.controlnet_type
         )
         
-        return response
-        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"生成图片时出错: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -258,41 +216,32 @@ async def generate_image_upload_general(
         raise HTTPException(status_code=503, detail="服务未就绪")
     
     try:
-        # 验证模型是否支持
+        # 获取支持的模型列表
         supported_models_data = concurrent_manager.get_model_list()
         supported_model_ids = [model['model_id'] for model in supported_models_data]
-        if model_id not in supported_model_ids:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"不支持的模型: {model_id}，支持的模型: {supported_model_ids}"
-            )
-        
-        # 验证参数
-        if not Config.validate_prompt(prompt):
-            raise HTTPException(status_code=400, detail="提示词长度超出限制")
-        
-        if not Config.validate_image_size(height, width):
-            raise HTTPException(status_code=400, detail="图片尺寸超出限制")
-        
-        # 验证controlnet类型
-        if mode == "controlnet":
-            valid_controlnet_types = ["depth", "canny", "openpose"]
-            if controlnet_type.lower() not in valid_controlnet_types:
-                raise HTTPException(status_code=400, detail=f"不支持的controlnet类型: {controlnet_type}，支持的类型: {valid_controlnet_types}")
         
         # 处理上传的文件
         input_image_base64 = None
         mask_image_base64 = None
         control_image_base64 = None
         
+        # 添加文件上传状态调试
+        
         if input_image:
+            logger.info(f"input_image详情: filename={input_image.filename}, content_type={input_image.content_type}")
             input_image_base64 = await file_to_base64(input_image)
+            logger.info(f"处理input_image: 文件大小={input_image.size if hasattr(input_image, 'size') else 'unknown'}")
         
         if mask_image:
+            logger.info(f"mask_image详情: filename={mask_image.filename}, content_type={mask_image.content_type}")
             mask_image_base64 = await file_to_base64(mask_image)
+            logger.info(f"处理mask_image: 文件大小={mask_image.size if hasattr(mask_image, 'size') else 'unknown'}")
         
         if control_image:
+            logger.info(f"control_image详情: filename={control_image.filename}, content_type={control_image.content_type}")
             control_image_base64 = await file_to_base64(control_image)
+            logger.info(f"处理control_image: 文件大小={control_image.size if hasattr(control_image, 'size') else 'unknown'}")
+        
         
         # 处理LoRA参数
         loras_list = None
@@ -302,48 +251,28 @@ async def generate_image_upload_general(
                 # 验证LoRA格式
                 if not isinstance(loras_list, list):
                     raise ValueError("loras参数必须是列表格式")
-                
-                for lora in loras_list:
-                    if not isinstance(lora, dict):
-                        raise ValueError("每个LoRA必须是字典格式")
-                    if 'name' not in lora:
-                        raise ValueError("每个LoRA必须包含name字段")
-                    if 'weight' not in lora:
-                        raise ValueError("每个LoRA必须包含weight字段")
-                    
-                    # 验证LoRA是否存在
-                    lora_path = Config.get_lora_path(lora['name'])
-                    if not lora_path:
-                        raise HTTPException(
-                            status_code=400, 
-                            detail=f"LoRA '{lora['name']}' 不存在，请检查 /loras 接口获取可用LoRA列表"
-                        )
-                    
-                    # 验证权重范围
-                    weight = lora.get('weight', 1.0)
-                    if not isinstance(weight, (int, float)) or weight < 0 or weight > 2:
-                        raise ValueError("LoRA权重必须在0-2之间")
-                        
             except json.JSONDecodeError:
                 raise HTTPException(status_code=400, detail="loras参数必须是有效的JSON格式")
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
         
-        # 验证模式特定参数
-        if mode == "img2img" and not input_image_base64:
-            raise HTTPException(status_code=400, detail="img2img模式需要提供input_image文件")
-        elif mode == "fill" and (not input_image_base64 or not mask_image_base64):
-            raise HTTPException(status_code=400, detail="fill模式需要提供input_image和mask_image文件")
-        elif mode == "controlnet" and not control_image_base64:
-            raise HTTPException(status_code=400, detail="controlnet模式需要提供control_image文件")
-        elif mode == "redux" and not input_image_base64:
-            raise HTTPException(status_code=400, detail="redux模式需要提供input_image文件")
-        
-        # 调用进程级并发管理器
-        result = await concurrent_manager.generate_image_async(
+        # 使用统一的验证工具
+        ValidationUtils.validate_generation_request(
             model_id=model_id,
             prompt=prompt,
-            priority=priority,
+            height=height,
+            width=width,
+            mode=mode,
+            controlnet_type=controlnet_type,
+            input_image=input_image_base64,
+            mask_image=mask_image_base64,
+            control_image=control_image_base64,
+            loras=loras_list,
+            supported_models=supported_model_ids
+        )
+        
+        # 构建任务参数
+        task_params = TaskUtils.build_task_params(
             height=height,
             width=width,
             num_inference_steps=num_inference_steps,
@@ -361,104 +290,94 @@ async def generate_image_upload_general(
             loras=loras_list
         )
         
-        # 构建响应
-        response = GenerateResponse(
-            success=result.get("success", False),
-            task_id=result.get("task_id", ""),
-            image_base64=result.get("image_base64"),
-            error=result.get("error"),
-            elapsed_time=result.get("elapsed_time"),
-            gpu_id=result.get("gpu_id"),
-            model_id=result.get("model_id"),
+        # 调用进程级并发管理器
+        result = await concurrent_manager.generate_image_async(
+            model_id=model_id,
+            prompt=prompt,
+            priority=priority,
+            **task_params
+        )
+        
+        # 使用统一的响应构建工具
+        return ResponseUtils.build_generation_response(
+            result=result,
             mode=mode,
             controlnet_type=controlnet_type
         )
         
-        return response
-        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"生成图片时出错: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/status")
 async def get_status():
-    """获取服务状态 - 进程级版本"""
+    """获取服务状态"""
     if not concurrent_manager:
-        return {"error": "服务未就绪"}
+        raise HTTPException(status_code=503, detail="服务未就绪")
+    
+    status = concurrent_manager.get_status()
+    return status
+
+@app.get("/task/{task_id}")
+async def get_task_result(task_id: str):
+    """根据task_id查询任务结果"""
+    if not concurrent_manager:
+        raise HTTPException(status_code=503, detail="服务未就绪")
     
     try:
-        # 获取并发管理器状态
-        concurrent_status = concurrent_manager.get_status()
+        result = concurrent_manager.get_task_result(task_id)
+        if not result:
+            raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
         
-        return {
-            "concurrent_manager": concurrent_status
-        }
-        
+        return result
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"获取状态时出错: {e}")
-        return {"error": str(e)}
+        logger.error(f"查询任务 {task_id} 结果时出错: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/models")
 async def get_models():
-    """获取模型列表 - 进程级版本"""
+    """获取支持的模型列表"""
     if not concurrent_manager:
-        return {"error": "服务未就绪"}
+        raise HTTPException(status_code=503, detail="服务未就绪")
     
-    try:
-        models = concurrent_manager.get_model_list()
-        return {"models": models}
-        
-    except Exception as e:
-        logger.error(f"获取模型列表时出错: {e}")
-        return {"error": str(e)}
+    return concurrent_manager.get_model_list()
 
 @app.get("/loras")
 async def get_loras():
-    """获取LoRA模型列表"""
+    """获取可用的LoRA列表"""
     try:
         loras = Config.get_lora_list()
         return {
             "success": True,
             "loras": loras,
-            "total_count": len(loras),
-            "base_path": Config.LORA_BASE_PATH
+            "total": len(loras)
         }
-        
     except Exception as e:
-        logger.error(f"获取LoRA列表时出错: {e}")
+        logger.error(f"获取LoRA列表失败: {e}")
         return {
             "success": False,
             "error": str(e),
             "loras": [],
-            "total_count": 0,
-            "base_path": Config.LORA_BASE_PATH
+            "total": 0
         }
 
 @app.get("/health")
 async def health_check():
     """健康检查"""
     if not concurrent_manager:
-        return {"status": "unhealthy", "error": "并发管理器未初始化"}
+        return {"status": "unhealthy", "reason": "concurrent_manager_not_initialized"}
     
-    try:
-        status = concurrent_manager.get_status()
-        alive_processes = status.get("alive_processes", 0)
-        total_processes = status.get("total_processes", 0)
-        
-        if alive_processes == total_processes and total_processes > 0:
-            return {"status": "healthy", "alive_processes": alive_processes}
-        else:
-            return {
-                "status": "degraded", 
-                "alive_processes": alive_processes,
-                "total_processes": total_processes
-            }
-            
-    except Exception as e:
-        return {"status": "unhealthy", "error": str(e)}
+    status = concurrent_manager.get_status()
+    if status.get("is_running", False):
+        return {"status": "healthy"}
+    else:
+        return {"status": "unhealthy", "reason": "concurrent_manager_not_running"}
 
 if __name__ == "__main__":
-    # 启动服务
     uvicorn.run(
         "main:app",
         host=Config.HOST,

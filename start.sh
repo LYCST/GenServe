@@ -60,7 +60,7 @@ export FLUX_REDUX_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Redux-dev"
 # =============================================================================
 
 # 基础模型GPU分配 (使用GPU 0和1)
-export FLUX_GPUS="0,1"
+export FLUX_GPUS="0,1,3,4"
 
 # Depth模型GPU分配 (使用GPU 2，如果不配置则使用基础模型的GPU)
 export FLUX_DEPTH_GPUS="5,6"
@@ -81,20 +81,23 @@ export FLUX_REDUX_GPUS="7"
 # 性能和并发配置
 # =============================================================================
 
-# 最大并发请求数
-export MAX_CONCURRENT_REQUESTS="10"
+# 调度器睡眠时间 - 减少以提高响应性
+export SCHEDULER_SLEEP_TIME="0.05"
 
-# 任务超时时间 (秒)
-export TASK_TIMEOUT="180"
+# 全局任务队列最大大小 - 增加缓冲
+export MAX_GLOBAL_QUEUE_SIZE="150"
 
-# 全局任务队列最大大小
-export MAX_GLOBAL_QUEUE_SIZE="100"
-
-# 每个GPU队列最大大小
+# 每个GPU队列最大大小 - 减少单个GPU过载
 export MAX_GPU_QUEUE_SIZE="5"
+
+# 任务超时时间 - 基于您的测试结果调整
+export TASK_TIMEOUT="240"
 
 # GPU内存清理阈值 (MB)
 export GPU_MEMORY_THRESHOLD_MB="800"
+
+# GPU内存清理间隔 - 增加频率
+export GPU_MEMORY_CLEANUP_INTERVAL="3"
 
 # 启用激进内存清理
 export ENABLE_AGGRESSIVE_CLEANUP="true"

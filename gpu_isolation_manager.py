@@ -17,754 +17,71 @@ logger = logging.getLogger(__name__)
 
 def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, result_queue):
     """GPU工作进程 - 在隔离环境中运行（顶层函数，支持spawn）"""
-    import torch
-    from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxFillPipeline, FluxControlPipeline, FluxPriorReduxPipeline
-    import base64
-    import io
-    from PIL import Image
+    import logging
     import traceback
     import queue
-    import logging
+    from models.flux_model import FluxModel
     import time
-    import gc
-    import psutil
     import os
-    
-    # 尝试导入PEFT相关库
-    try:
-        from peft import PeftModel
-        PEFT_AVAILABLE = True
-    except ImportError:
-        PEFT_AVAILABLE = False
-        logging.warning(f"PEFT库未安装，LoRA功能将不可用")
-    
-    # 注意：PeftConfig在新版本transformers中可能不可用，我们只需要PEFT库本身
-    TRANSFORMERS_PEFT_AVAILABLE = True  # 简化检查，主要依赖PEFT库
-    
+    import gc
+
     logger = logging.getLogger(f"gpu_worker_{gpu_id}")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-    
-    def load_image_from_base64(image_data: str):
-        """从base64加载图片"""
-        if not image_data:
-            raise ValueError("图片数据为空")
-        
-        try:
-            # 处理data URL格式
-            if image_data.startswith('data:image'):
-                image_data = image_data.split(',')[1]
-            
-            # 解码base64
-            image_bytes = base64.b64decode(image_data)
-            image = Image.open(io.BytesIO(image_bytes))
-            
-            # 转换为RGB模式
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
-            
-            return image
-        except Exception as e:
-            raise ValueError(f"加载图片失败: {str(e)}")
-    
-    # 设置进程优先级和内存限制
+    model = None
     try:
-        process = psutil.Process()
-        process.nice(10)  # 降低进程优先级，减少被OOM Killer杀死的概率
-        logger.info(f"🚀 GPU {gpu_id} 工作进程启动 (PID: {os.getpid()}, 优先级: {process.nice()})")
-    except Exception as e:
-        logger.warning(f"无法设置进程优先级: {e}")
-        logger.info(f"🚀 GPU {gpu_id} 工作进程启动 (PID: {os.getpid()})")
-    
-    try:
-        logger.info(f"正在加载模型到GPU {gpu_id}...")
-        
-        # 加载前清理内存
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        
-        # 根据模型ID确定实际的模型路径
-        from config import Config
-        model_paths = Config.get_model_paths()
-        actual_model_path = model_paths.get(model_id, model_path)
-        
-        # 对于Redux模型，需要特殊处理：基础pipeline使用flux1-dev模型路径
-        if model_id == "flux1-redux-dev":
-            base_model_path = model_paths.get("flux1-dev", actual_model_path)
-            logger.info(f"GPU {gpu_id} Redux模型使用基础模型路径: {base_model_path}")
-        else:
-            base_model_path = actual_model_path
-        
-        logger.info(f"GPU {gpu_id} 使用模型路径: {actual_model_path}")
-        
-        # 初始化pipeline字典 - 支持多种controlnet类型和redux
-        pipelines = {
-            "text2img": None,
-            "img2img": None,
-            "fill": None,
-            "controlnet_depth": None,
-            "controlnet_canny": None,
-            "controlnet_openpose": None,
-            "redux": None
-        }
-        
-        # 加载基础text2img pipeline
-        pipelines["text2img"] = FluxPipeline.from_pretrained(
-            base_model_path,
-            torch_dtype=torch.bfloat16,
-            use_safetensors=True,
-            local_files_only=True
-        )
-        pipelines["text2img"].enable_model_cpu_offload(device="cuda:0")
-        logger.info(f"✅ 基础模型已加载到GPU {gpu_id}")
-        
-        task_count = 0
-        consecutive_failures = 0  # 连续失败计数
-        max_consecutive_failures = 3  # 最大连续失败次数
-        last_cleanup_time = time.time()  # 上次清理时间
-        
+        # 在GPU工作进程中，由于设置了CUDA_VISIBLE_DEVICES，只能看到GPU 0
+        # 所以使用cuda:0而不是cuda:{gpu_id}
+        model = FluxModel(model_id=model_id, gpu_device="cuda:0", physical_gpu_id=gpu_id)
+        if not model.load():
+            logger.error(f"模型加载失败: {model_id} on GPU {gpu_id}")
+            result_queue.put({"success": False, "error": f"模型加载失败: {model_id}", "gpu_id": gpu_id})
+            return
+        logger.info(f"模型 {model_id} 已加载到GPU {gpu_id}")
         while True:
             try:
-                # 定期内存清理
-                current_time = time.time()
-                if current_time - last_cleanup_time > Config.GPU_MEMORY_CLEANUP_INTERVAL:
-                    if torch.cuda.is_available():
-                        allocated = torch.cuda.memory_allocated() / 1024**2
-                        if allocated > Config.GPU_MEMORY_THRESHOLD_MB:
-                            logger.info(f"GPU {gpu_id} 定期清理内存 (已分配: {allocated:.1f}MB)")
-                            torch.cuda.empty_cache()
-                            torch.cuda.synchronize()
-                            gc.collect()
-                    last_cleanup_time = current_time
-                
                 task = task_queue.get(timeout=1.0)
                 if task is None:
                     logger.info(f"GPU {gpu_id} 收到退出信号")
                     break
                 
-                task_count += 1
-                logger.info(f"GPU {gpu_id} 开始处理任务 #{task_count}: {task.get('task_id', 'unknown')}")
+                task_id = task.get('task_id', 'unknown')
+                logger.info(f"🎯 GPU {gpu_id} 进程接收到任务: {task_id[:8]}")
+                logger.info(f"📋 任务详情: 提示词='{task.get('prompt', '')[:50]}{'...' if len(task.get('prompt', '')) > 50 else ''}', 模式={task.get('mode', 'unknown')}")
                 
-                # 任务开始前检查内存状态
-                if torch.cuda.is_available():
-                    initial_allocated = torch.cuda.memory_allocated() / 1024**2
-                    initial_cached = torch.cuda.memory_reserved() / 1024**2
-                    logger.info(f"GPU {gpu_id} 任务开始前内存: 已分配 {initial_allocated:.1f}MB, 缓存 {initial_cached:.1f}MB")
-                    
-                    # 如果内存使用过高，强制清理
-                    if initial_allocated > Config.GPU_MEMORY_THRESHOLD_MB:
-                        logger.warning(f"GPU {gpu_id} 内存使用过高 ({initial_allocated:.1f}MB > {Config.GPU_MEMORY_THRESHOLD_MB}MB)，强制清理")
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                        gc.collect()
+                try:
+                    logger.info(f"🚀 GPU {gpu_id} 开始处理任务: {task_id[:8]}")
+                    result = model.generate(**task)
+                    result['task_id'] = task_id
+                    result['gpu_id'] = gpu_id
+                    logger.info(f"✅ GPU {gpu_id} 任务 {task_id[:8]} 处理完成，准备发送结果")
+                    result_queue.put(result)
+                    logger.info(f"📤 GPU {gpu_id} 任务 {task_id[:8]} 结果已发送到结果队列")
+                except Exception as e:
+                    logger.error(f"❌ GPU {gpu_id} 模型推理异常: {e}")
+                    logger.error(traceback.format_exc())
+                    error_result = {
+                        "success": False,
+                        "error": str(e),
+                        "task_id": task_id,
+                        "gpu_id": gpu_id
+                    }
+                    result_queue.put(error_result)
+                    logger.error(f"📤 GPU {gpu_id} 任务 {task_id[:8]} 错误结果已发送")
                 
-                # 处理任务
-                result = process_generation_task(pipelines, task, gpu_id, load_image_from_base64, actual_model_path)
-                result_queue.put(result)
-                
-                success = result.get('success', False)
-                logger.info(f"GPU {gpu_id} 任务 #{task_count} 处理完成: {success}")
-                
-                # 更新连续失败计数
-                if success:
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
-                
-                # 任务完成后进行清理和等待
-                if success:
-                    logger.info(f"GPU {gpu_id} 开始清理资源...")
-                    
-                    # 更激进的内存清理
-                    if torch.cuda.is_available():
-                        # 多次清理确保彻底
-                        for i in range(3):
-                            torch.cuda.empty_cache()
-                            torch.cuda.synchronize()
-                            time.sleep(0.1)
-                        
-                        torch.cuda.reset_peak_memory_stats()
-                        
-                        # 如果启用激进清理，进行额外清理
-                        if Config.ENABLE_AGGRESSIVE_CLEANUP:
-                            # 强制垃圾回收多次
-                            for i in range(2):
-                                gc.collect()
-                                time.sleep(0.05)
-                    
-                    # 强制垃圾回收
-                    gc.collect()
-                    
-                    # 等待一段时间确保清理完成
-                    cleanup_wait_time = Config.GPU_TASK_CLEANUP_WAIT_TIME
-                    logger.info(f"GPU {gpu_id} 等待 {cleanup_wait_time} 秒确保清理完成...")
-                    time.sleep(cleanup_wait_time)
-                    
-                    # 记录清理后的内存状态
-                    if torch.cuda.is_available():
-                        allocated = torch.cuda.memory_allocated() / 1024**2
-                        cached = torch.cuda.memory_reserved() / 1024**2
-                        logger.info(f"GPU {gpu_id} 清理后内存: 已分配 {allocated:.1f}MB, 缓存 {cached:.1f}MB")
-                        
-                        # 如果内存仍然过高，进行额外清理
-                        if allocated > Config.GPU_MEMORY_THRESHOLD_MB:
-                            logger.warning(f"GPU {gpu_id} 清理后内存仍然过高 ({allocated:.1f}MB)，进行额外清理")
-                            torch.cuda.empty_cache()
-                            torch.cuda.synchronize()
-                            gc.collect()
-                    
-                    logger.info(f"GPU {gpu_id} 清理完成，准备接收下一个任务")
-                else:
-                    logger.warning(f"GPU {gpu_id} 任务失败，跳过清理等待")
-                    
-                    # 失败后也要清理内存
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                        gc.collect()
-                
-                # 检查连续失败次数
-                if consecutive_failures >= max_consecutive_failures:
-                    logger.error(f"GPU {gpu_id} 连续失败 {consecutive_failures} 次，准备重启进程")
-                    break
+                # 推理后可选清理
+                gc.collect()
+                logger.info(f"🧹 GPU {gpu_id} 任务 {task_id[:8]} 内存清理完成")
                 
             except queue.Empty:
                 continue
             except Exception as e:
-                error_msg = f"GPU {gpu_id} 处理任务时出错: {str(e)}"
-                logger.error(error_msg)
-                logger.error(f"错误详情: {traceback.format_exc()}")
-                
-                consecutive_failures += 1
-                
-                try:
-                    result_queue.put({
-                        "success": False,
-                        "error": str(e),
-                        "gpu_id": gpu_id,
-                        "task_id": task.get('task_id') if 'task' in locals() else 'unknown'
-                    })
-                except Exception as put_error:
-                    logger.error(f"GPU {gpu_id} 无法返回错误结果: {put_error}")
-                
-                # 异常后清理内存
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    gc.collect()
-        
-        logger.info(f"GPU {gpu_id} 开始最终清理资源...")
-        # 清理所有pipeline
-        for pipeline in pipelines.values():
-            if pipeline is not None:
-                del pipeline
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        gc.collect()
+                logger.error(f"❌ GPU {gpu_id} 进程异常: {e}")
+                logger.error(traceback.format_exc())
+                break
+    finally:
+        if model is not None:
+            model.unload()
         logger.info(f"GPU {gpu_id} 工作进程退出")
-    except Exception as e:
-        error_msg = f"GPU {gpu_id} 工作进程启动失败: {str(e)}"
-        logger.error(error_msg)
-        logger.error(f"启动错误详情: {traceback.format_exc()}")
-        try:
-            result_queue.put({
-                "success": False,
-                "error": f"进程启动失败: {str(e)}",
-                "gpu_id": gpu_id
-            })
-        except Exception as put_error:
-            logger.error(f"GPU {gpu_id} 无法返回启动失败结果: {put_error}")
-
-def process_generation_task(pipelines, task, gpu_id: str, load_image_func, model_path: str):
-    import torch
-    import io
-    import base64
-    import time
-    import traceback
-    from PIL import Image
-    import os
-    from diffusers import FluxPipeline, FluxImg2ImgPipeline, FluxFillPipeline, FluxControlPipeline, FluxPriorReduxPipeline
-    
-    # 尝试导入PEFT相关库
-    try:
-        from peft import PeftModel
-        PEFT_AVAILABLE = True
-    except ImportError:
-        PEFT_AVAILABLE = False
-        logging.warning(f"PEFT库未安装，LoRA功能将不可用")
-    
-    # 注意：PeftConfig在新版本transformers中可能不可用，我们只需要PEFT库本身
-    TRANSFORMERS_PEFT_AVAILABLE = True  # 简化检查，主要依赖PEFT库
-    
-    logger = logging.getLogger(f"gpu_worker_{gpu_id}")
-    start_time = time.time()
-    
-    def create_safe_adapter_name(lora_name: str, index: int, timestamp: int, random_suffix: int) -> str:
-        """创建安全的adapter名称"""
-        # 移除所有特殊字符，只保留字母、数字和下划线
-        import re
-        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', lora_name)
-        # 确保不以数字开头
-        if safe_name and safe_name[0].isdigit():
-            safe_name = 'lora_' + safe_name
-        # 限制长度
-        if len(safe_name) > 50:
-            safe_name = safe_name[:50]
-        return f"lora_{index}_{safe_name}_{timestamp}_{random_suffix}"
-    
-    # 记录任务开始时的内存状态
-    if torch.cuda.is_available():
-        initial_allocated = torch.cuda.memory_allocated() / 1024**2
-        initial_cached = torch.cuda.memory_reserved() / 1024**2
-        logger.info(f"GPU {gpu_id} 任务开始前内存: 已分配 {initial_allocated:.1f}MB, 缓存 {initial_cached:.1f}MB")
-    
-    try:
-        logger.info(f"GPU {gpu_id} 开始生成任务: {task.get('task_id', 'unknown')}")
-        generator = torch.Generator("cpu").manual_seed(task.get('seed', 42))
-        
-        # 获取生成模式和模型ID
-        mode = task.get('mode', 'text2img')
-        model_id = task.get('model_id', 'flux1-dev')
-        logger.info(f"GPU {gpu_id} 使用模式: {mode}, 模型: {model_id}")
-        
-        # 根据模型ID确定实际的模型路径
-        from config import Config
-        model_paths = Config.get_model_paths()
-        actual_model_path = model_paths.get(model_id, model_path)
-        
-        # 通用尺寸处理逻辑
-        def get_output_dimensions(input_image, mode):
-            """获取输出尺寸：优先使用用户指定，否则使用图片原始尺寸，并确保是16的倍数"""
-            user_height = task.get('height')
-            user_width = task.get('width')
-            original_width, original_height = input_image.size  # PIL返回(width, height)
-            
-            # 检查是否用户明确指定了尺寸（不是默认值）
-            if user_height == 1024 and user_width == 1024 and mode != 'text2img':
-                height = original_height
-                width = original_width
-                logger.info(f"GPU {gpu_id} 使用图片原始尺寸: {width}x{height}")
-            else:
-                height = user_height
-                width = user_width
-                logger.info(f"GPU {gpu_id} 使用用户指定尺寸: {width}x{height}")
-            
-            # 确保尺寸是16的倍数（ControlNet要求）
-            if mode == 'controlnet':
-                # Flux ControlNet对尺寸有特殊要求
-                # 使用标准尺寸：512x512, 768x768, 1024x1024
-                # 避免使用非标准尺寸，可能导致latent packing错误
-                
-                # 计算最接近的标准尺寸
-                target_size = max(width, height)
-                if target_size <= 512:
-                    width = height = 512
-                elif target_size <= 768:
-                    width = height = 768
-                else:
-                    width = height = 1024
-                
-                logger.info(f"GPU {gpu_id} ControlNet使用标准尺寸: {width}x{height}")
-            
-            return width, height
-        
-        # 根据模式选择或加载pipeline
-        if mode == 'text2img':
-            pipe = pipelines["text2img"]
-        elif mode == 'img2img':
-            if pipelines["img2img"] is None:
-                logger.info(f"GPU {gpu_id} 加载img2img pipeline...")
-                
-                # 使用专门的模型路径（如果有的话）
-                model_paths = Config.get_model_paths()
-                img2img_model_path = model_paths.get("flux1-dev", actual_model_path)  # img2img使用基础模型
-                
-                if not os.path.exists(img2img_model_path):
-                    # 如果路径不存在，使用传入的路径
-                    img2img_model_path = actual_model_path
-                    logger.warning(f"GPU {gpu_id} img2img模型路径不存在，使用传入路径: {img2img_model_path}")
-                else:
-                    logger.info(f"GPU {gpu_id} 使用img2img模型路径: {img2img_model_path}")
-                
-                try:
-                    pipelines["img2img"] = FluxImg2ImgPipeline.from_pretrained(
-                        img2img_model_path,
-                        torch_dtype=torch.bfloat16,
-                        use_safetensors=True,
-                        local_files_only=True
-                    )
-                    pipelines["img2img"].enable_model_cpu_offload(device="cuda:0")
-                    logger.info(f"GPU {gpu_id} img2img pipeline加载完成")
-                except Exception as e:
-                    logger.error(f"GPU {gpu_id} 加载img2img pipeline失败: {e}")
-                    # 如果img2img加载失败，尝试使用基础pipeline
-                    logger.info(f"GPU {gpu_id} 尝试使用基础pipeline进行img2img操作")
-                    pipelines["img2img"] = pipelines["text2img"]
-            pipe = pipelines["img2img"]
-        elif mode == 'fill':
-            if pipelines["fill"] is None:
-                logger.info(f"GPU {gpu_id} 加载fill pipeline...")
-                
-                # 使用专门的Fill模型路径
-                model_paths = Config.get_model_paths()
-                fill_model_path = model_paths.get("flux1-fill-dev", actual_model_path)
-                
-                if not os.path.exists(fill_model_path):
-                    # 如果专用Fill模型路径不存在，使用基础路径
-                    fill_model_path = actual_model_path
-                    logger.warning(f"GPU {gpu_id} 专用Fill模型路径不存在，使用基础模型: {fill_model_path}")
-                else:
-                    logger.info(f"GPU {gpu_id} 使用Fill模型路径: {fill_model_path}")
-                
-                try:
-                    pipelines["fill"] = FluxFillPipeline.from_pretrained(
-                        fill_model_path,
-                        torch_dtype=torch.bfloat16,
-                        use_safetensors=True,
-                        local_files_only=True
-                    )
-                    pipelines["fill"].enable_model_cpu_offload(device="cuda:0")
-                    logger.info(f"GPU {gpu_id} fill pipeline加载完成")
-                except Exception as e:
-                    logger.error(f"GPU {gpu_id} 加载fill pipeline失败: {e}")
-                    # 如果fill加载失败，尝试使用基础pipeline
-                    logger.info(f"GPU {gpu_id} 尝试使用基础pipeline进行fill操作")
-                    pipelines["fill"] = pipelines["text2img"]
-            pipe = pipelines["fill"]
-        elif mode == 'controlnet':
-            # 获取controlnet类型
-            controlnet_type = task.get('controlnet_type', 'depth').lower()
-            pipeline_key = f"controlnet_{controlnet_type}"
-            
-            if pipeline_key not in pipelines:
-                raise ValueError(f"不支持的controlnet类型: {controlnet_type}")
-            
-            if pipelines[pipeline_key] is None:
-                logger.info(f"GPU {gpu_id} 加载{controlnet_type} controlnet pipeline...")
-                
-                # 根据类型选择模型路径
-                model_paths = Config.get_model_paths()
-                if controlnet_type == 'depth':
-                    controlnet_model_path = model_paths.get("flux1-depth-dev", actual_model_path)
-                elif controlnet_type == 'canny':
-                    controlnet_model_path = model_paths.get("flux1-canny-dev", actual_model_path)
-                elif controlnet_type == 'openpose':
-                    controlnet_model_path = model_paths.get("flux1-openpose-dev", actual_model_path)
-                else:
-                    raise ValueError(f"不支持的controlnet类型: {controlnet_type}")
-                
-                if not os.path.exists(controlnet_model_path):
-                    # 如果专用路径不存在，使用基础路径
-                    controlnet_model_path = actual_model_path
-                    logger.warning(f"GPU {gpu_id} 专用{controlnet_type} controlnet模型路径不存在，使用基础模型: {controlnet_model_path}")
-                else:
-                    logger.info(f"GPU {gpu_id} 使用{controlnet_type} controlnet模型路径: {controlnet_model_path}")
-                
-                try:
-                    pipelines[pipeline_key] = FluxControlPipeline.from_pretrained(
-                        controlnet_model_path,
-                        torch_dtype=torch.bfloat16,
-                        use_safetensors=True,
-                        local_files_only=True
-                    )
-                    pipelines[pipeline_key].enable_model_cpu_offload(device="cuda:0")
-                    logger.info(f"GPU {gpu_id} {controlnet_type} controlnet pipeline加载完成")
-                except Exception as e:
-                    logger.error(f"GPU {gpu_id} 加载{controlnet_type} controlnet pipeline失败: {e}")
-                    # ControlNet pipeline加载失败，直接抛出错误
-                    raise ValueError(f"无法加载{controlnet_type} ControlNet pipeline。请确保模型路径包含ControlNet组件: {controlnet_model_path}")
-            
-            pipe = pipelines[pipeline_key]
-        elif mode == 'redux':
-            if pipelines["redux"] is None:
-                logger.info(f"GPU {gpu_id} 加载redux pipeline...")
-                
-                # 使用专门的Redux模型路径
-                model_paths = Config.get_model_paths()
-                redux_model_path = model_paths.get("flux1-redux-dev", actual_model_path)
-                
-                # 对于Redux，基础pipeline需要使用flux1-dev模型路径
-                base_model_path = model_paths.get("flux1-dev", actual_model_path)
-                
-                if not os.path.exists(redux_model_path):
-                    # 如果专用Redux模型路径不存在，使用基础路径
-                    redux_model_path = actual_model_path
-                    logger.warning(f"GPU {gpu_id} 专用Redux模型路径不存在，使用基础模型: {redux_model_path}")
-                else:
-                    logger.info(f"GPU {gpu_id} 使用Redux模型路径: {redux_model_path}")
-                
-                logger.info(f"GPU {gpu_id} 使用基础模型路径: {base_model_path}")
-                
-                try:
-                    # 加载Redux pipeline - 需要两个pipeline
-                    pipelines["redux"] = {
-                        "prior": FluxPriorReduxPipeline.from_pretrained(
-                            redux_model_path,
-                            torch_dtype=torch.bfloat16,
-                            use_safetensors=True,
-                            local_files_only=True
-                        ),
-                        "base": FluxPipeline.from_pretrained(
-                            base_model_path,  # 使用基础模型路径，而不是redux模型路径
-                            text_encoder=None,
-                            text_encoder_2=None,
-                            torch_dtype=torch.bfloat16,
-                            use_safetensors=True,
-                            local_files_only=True
-                        )
-                    }
-                    
-                    # 启用CPU卸载
-                    pipelines["redux"]["prior"].enable_model_cpu_offload(device="cuda:0")
-                    pipelines["redux"]["base"].enable_model_cpu_offload(device="cuda:0")
-                    
-                    logger.info(f"GPU {gpu_id} redux pipeline加载完成")
-                except Exception as e:
-                    logger.error(f"GPU {gpu_id} 加载redux pipeline失败: {e}")
-                    # Redux pipeline加载失败，直接抛出错误
-                    raise ValueError(f"无法加载Redux pipeline。请确保模型路径包含Redux组件: {redux_model_path}")
-            
-            pipe = pipelines["redux"]
-        else:
-            raise ValueError(f"不支持的生成模式: {mode}")
-        
-        # 加载和应用LoRA
-        loras = task.get('loras', [])
-        if loras:
-            if not PEFT_AVAILABLE:
-                raise ValueError("PEFT库未安装，无法使用LoRA功能。请安装: pip install peft")
-            
-            logger.info(f"GPU {gpu_id} 开始加载 {len(loras)} 个LoRA...")
-            
-            adapter_names = []
-            adapter_weights = []
-            
-            # 添加时间戳和随机数确保adapter_name唯一性
-            import time
-            import random
-            timestamp = int(time.time() * 1000)  # 毫秒时间戳
-            random_suffix = random.randint(1000, 9999)  # 4位随机数
-            
-            for i, lora in enumerate(loras):
-                lora_name = lora.get('name')
-                lora_weight = lora.get('weight', 1.0)
-                
-                # 获取LoRA路径
-                lora_path = Config.get_lora_path(lora_name)
-                if not lora_path:
-                    raise ValueError(f"LoRA '{lora_name}' 不存在")
-                
-                # 生成唯一的adapter_name
-                adapter_name = create_safe_adapter_name(lora_name, i, timestamp, random_suffix)
-                adapter_names.append(adapter_name)
-                adapter_weights.append(lora_weight)
-                
-                try:
-                    logger.info(f"GPU {gpu_id} 加载LoRA: {lora_name} (权重: {lora_weight}) -> adapter: {adapter_name}")
-                    
-                    # 检查LoRA文件是否存在
-                    if not os.path.exists(lora_path):
-                        raise ValueError(f"LoRA文件不存在: {lora_path}")
-                    
-                    # 尝试加载LoRA
-                    pipe.load_lora_weights(lora_path, adapter_name=adapter_name)
-                    logger.info(f"GPU {gpu_id} LoRA {lora_name} 加载成功")
-                    
-                except Exception as e:
-                    error_msg = str(e)
-                    if "PEFT backend is required" in error_msg:
-                        raise ValueError(f"PEFT后端未正确配置。请确保安装了正确的PEFT版本: pip install peft transformers")
-                    elif "not a valid LoRA" in error_msg:
-                        raise ValueError(f"LoRA文件格式无效或与当前模型不兼容: {lora_name}")
-                    elif "already in use" in error_msg:
-                        raise ValueError(f"LoRA适配器名称冲突，请重试: {lora_name}")
-                    else:
-                        raise ValueError(f"加载LoRA {lora_name} 失败: {error_msg}")
-            
-            # 设置LoRA适配器
-            if adapter_names:
-                try:
-                    pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
-                    logger.info(f"GPU {gpu_id} 设置LoRA适配器: {adapter_names} (权重: {adapter_weights})")
-                except Exception as e:
-                    logger.error(f"GPU {gpu_id} 设置LoRA适配器失败: {e}")
-                    raise ValueError(f"设置LoRA适配器失败: {str(e)}")
-        
-        with torch.no_grad():
-            if mode == 'text2img':
-                result = pipe(
-                    prompt=task['prompt'],
-                    height=task.get('height', 1024),
-                    width=task.get('width', 1024),
-                    guidance_scale=task.get('cfg', 3.5),
-                    num_inference_steps=task.get('num_inference_steps', 50),
-                    max_sequence_length=512,
-                    generator=generator
-                )
-            elif mode == 'img2img':
-                # 加载输入图片
-                input_image = load_image_func(task.get('input_image'))
-                
-                # 获取尺寸：优先使用用户指定，否则使用图片原始尺寸
-                width, height = get_output_dimensions(input_image, mode)
-                
-                result = pipe(
-                    prompt=task['prompt'],
-                    image=input_image,
-                    height=height,
-                    width=width,
-                    strength=task.get('strength', 0.8),
-                    guidance_scale=task.get('cfg', 3.5),
-                    num_inference_steps=task.get('num_inference_steps', 50),
-                    max_sequence_length=512,
-                    generator=generator
-                )
-            elif mode == 'fill':
-                # 加载输入图片和蒙版
-                input_image = load_image_func(task.get('input_image'))
-                mask_image = load_image_func(task.get('mask_image'))
-                
-                # 获取尺寸：优先使用用户指定，否则使用图片原始尺寸
-                width, height = get_output_dimensions(input_image, mode)
-                
-                # 根据官方示例，使用原始图片尺寸
-                result = pipe(
-                    prompt=task['prompt'],
-                    image=input_image,
-                    mask_image=mask_image,
-                    height=height,
-                    width=width,
-                    guidance_scale=task.get('cfg', 30.0),  # Fill模式推荐使用30
-                    num_inference_steps=task.get('num_inference_steps', 50),
-                    max_sequence_length=512,
-                    generator=generator
-                )
-            elif mode == 'controlnet':
-                # 加载控制图片
-                control_image = load_image_func(task.get('control_image'))
-                controlnet_type = task.get('controlnet_type', 'depth')
-                
-                # 获取尺寸：优先使用用户指定，否则使用控制图片原始尺寸
-                width, height = get_output_dimensions(control_image, mode)
-                
-                # 如果同时提供了input_image，记录但不使用（ControlNet模式主要使用control_image）
-                if task.get('input_image'):
-                    logger.info(f"GPU {gpu_id} ControlNet模式检测到input_image，但主要使用control_image")
-                
-                # 构建ControlNet调用参数 - FluxControlPipeline只支持基本参数
-                controlnet_kwargs = {
-                    'prompt': task['prompt'],
-                    'control_image': control_image,
-                    'height': height,
-                    'width': width,
-                    'guidance_scale': task.get('cfg', 10.0),  # controlnet推荐使用10.0
-                    'num_inference_steps': task.get('num_inference_steps', 30),  # controlnet推荐使用30步
-                    'max_sequence_length': 512,
-                    'generator': generator
-                }
-                
-                # 记录用户提供的ControlNet强度控制参数（但不使用，因为FluxControlPipeline不支持）
-                if task.get('controlnet_conditioning_scale') is not None:
-                    logger.info(f"GPU {gpu_id} 用户提供了controlnet_conditioning_scale: {task.get('controlnet_conditioning_scale')}，但FluxControlPipeline不支持此参数")
-                
-                if task.get('control_guidance_start') is not None:
-                    logger.info(f"GPU {gpu_id} 用户提供了control_guidance_start: {task.get('control_guidance_start')}，但FluxControlPipeline不支持此参数")
-                
-                if task.get('control_guidance_end') is not None:
-                    logger.info(f"GPU {gpu_id} 用户提供了control_guidance_end: {task.get('control_guidance_end')}，但FluxControlPipeline不支持此参数")
-                
-                result = pipe(**controlnet_kwargs)
-            elif mode == 'redux':
-                # 加载输入图片
-                input_image = load_image_func(task.get('input_image'))
-                
-                # 获取尺寸：优先使用用户指定，否则使用图片原始尺寸
-                width, height = get_output_dimensions(input_image, mode)
-                
-                logger.info(f"GPU {gpu_id} 开始Redux处理，输入图片尺寸: {input_image.size}")
-                
-                # Redux处理流程：先运行prior pipeline，再运行base pipeline
-                try:
-                    # 第一步：运行prior pipeline
-                    logger.info(f"GPU {gpu_id} 运行Redux prior pipeline...")
-                    prior_output = pipe["prior"](input_image)
-                    
-                    # 第二步：运行base pipeline
-                    logger.info(f"GPU {gpu_id} 运行Redux base pipeline...")
-                    result = pipe["base"](
-                        guidance_scale=task.get('cfg', 2.5),  # Redux推荐使用2.5
-                        num_inference_steps=task.get('num_inference_steps', 50),
-                        generator=generator,
-                        **prior_output
-                    )
-                    
-                    logger.info(f"GPU {gpu_id} Redux处理完成")
-                    
-                except Exception as e:
-                    logger.error(f"GPU {gpu_id} Redux处理失败: {e}")
-                    raise ValueError(f"Redux处理失败: {str(e)}")
-            else:
-                raise ValueError(f"不支持的生成模式: {mode}")
-        
-        image = result.images[0]
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        img_base64 = base64.b64encode(buffer.getvalue()).decode()
-        elapsed_time = time.time() - start_time
-        
-        # 记录任务完成时的内存状态
-        if torch.cuda.is_available():
-            final_allocated = torch.cuda.memory_allocated() / 1024**2
-            final_cached = torch.cuda.memory_reserved() / 1024**2
-            memory_increase = final_allocated - initial_allocated
-            logger.info(f"GPU {gpu_id} 任务完成后内存: 已分配 {final_allocated:.1f}MB (+{memory_increase:.1f}MB), 缓存 {final_cached:.1f}MB")
-        
-        logger.info(f"GPU {gpu_id} {mode}生成成功，耗时: {elapsed_time:.2f}秒")
-        
-        # 处理保存到磁盘
-        save_to_disk = False
-        save_path = task.get('save_disk_path')
-        if save_path:
-            try:
-                image.save(save_path)
-                save_to_disk = True
-                logger.info(f"GPU {gpu_id} 图片已保存到: {save_path}")
-            except Exception as e:
-                logger.warning(f"GPU {gpu_id} 保存图片失败: {e}")
-        
-        return {
-            "success": True,
-            "image_base64": img_base64,
-            "elapsed_time": elapsed_time,
-            "gpu_id": gpu_id,
-            "task_id": task.get('task_id'),
-            "save_to_disk": save_to_disk,
-            "params": task,
-            "mode": mode,
-            "controlnet_type": task.get('controlnet_type') if mode == 'controlnet' else None
-        }
-    except Exception as e:
-        elapsed_time = time.time() - start_time
-        error_msg = f"GPU {gpu_id} {mode}生成失败: {str(e)}"
-        logger.error(error_msg)
-        logger.error(f"生成错误详情: {traceback.format_exc()}")
-        
-        # 记录错误时的内存状态
-        if torch.cuda.is_available():
-            error_allocated = torch.cuda.memory_allocated() / 1024**2
-            error_cached = torch.cuda.memory_reserved() / 1024**2
-            logger.error(f"GPU {gpu_id} 错误时内存: 已分配 {error_allocated:.1f}MB, 缓存 {error_cached:.1f}MB")
-        
-        return {
-            "success": False,
-            "error": str(e),
-            "elapsed_time": elapsed_time,
-            "gpu_id": gpu_id,
-            "task_id": task.get('task_id'),
-            "mode": mode,
-            "controlnet_type": task.get('controlnet_type') if mode == 'controlnet' else None
-        }
 
 class GPUIsolationManager:
     """GPU隔离管理器 - 使用子进程实现真正的GPU隔离"""
@@ -889,18 +206,18 @@ class GPUIsolationManager:
         
         return restart_results
     
-    def submit_task(self, gpu_id: str, model_id: str, task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """提交任务到指定GPU"""
+    def submit_task(self, gpu_id: str, model_id: str, task: Dict[str, Any]) -> bool:
+        """提交任务到指定GPU - 异步提交，不等待结果"""
         process_key = f"{model_id}_{gpu_id}"
         
         if process_key not in self.task_queues:
             logger.error(f"GPU {gpu_id} 进程不存在")
-            return None
+            return False
         
         # 检查进程是否还活着
         if process_key not in self.processes:
             logger.error(f"GPU {gpu_id} 进程记录不存在")
-            return None
+            return False
             
         process = self.processes[process_key]
         if not process.is_alive():
@@ -913,29 +230,49 @@ class GPUIsolationManager:
                 # 重新获取进程和队列
                 process = self.processes[process_key]
                 task_queue = self.task_queues[process_key]
-                result_queue = self.result_queues[process_key]
             else:
-                return {
-                    "success": False,
-                    "error": f"GPU进程已死亡且重启失败 (exitcode: {process.exitcode})",
-                    "gpu_id": gpu_id
-                }
+                return False
         else:
             task_queue = self.task_queues[process_key]
-            result_queue = self.result_queues[process_key]
         
         try:
-            # 提交任务
-            logger.info(f"提交任务到GPU {gpu_id} (PID: {process.pid}): {task.get('task_id', 'unknown')}")
-            task_queue.put(task)
+            # 异步提交任务，不等待结果
+            task_id = task.get('task_id', 'unknown')
+            logger.info(f"📤 异步提交任务到GPU {gpu_id} (PID: {process.pid}): {task_id[:8]}")
+            logger.info(f"📋 任务详情: 提示词='{task.get('prompt', '')[:50]}{'...' if len(task.get('prompt', '')) > 50 else ''}', 模式={task.get('mode', 'unknown')}")
             
+            task_queue.put(task, block=False)  # 非阻塞提交
+            logger.info(f"✅ 任务 {task_id[:8]} 已成功提交到GPU {gpu_id} 任务队列")
+            return True
+            
+        except queue.Full:
+            error_msg = f"GPU {gpu_id} 任务队列已满"
+            logger.error(error_msg)
+            return False
+        except Exception as e:
+            error_msg = f"提交任务到GPU {gpu_id} 失败: {str(e)}"
+            logger.error(error_msg)
+            logger.error(f"错误详情: {traceback.format_exc()}")
+            return False
+    
+    def get_task_result(self, gpu_id: str, model_id: str, timeout: float = 300) -> Optional[Dict[str, Any]]:
+        """从指定GPU获取任务结果 - 可选使用"""
+        process_key = f"{model_id}_{gpu_id}"
+        
+        if process_key not in self.result_queues:
+            logger.error(f"GPU {gpu_id} 结果队列不存在")
+            return None
+        
+        result_queue = self.result_queues[process_key]
+        
+        try:
             # 等待结果
-            result = result_queue.get(timeout=300)  # 5分钟超时
-            logger.info(f"GPU {gpu_id} 任务完成: {result.get('success', False)}")
+            result = result_queue.get(timeout=timeout)
+            logger.info(f"GPU {gpu_id} 获取到结果: {result.get('success', False)}")
             return result
             
         except queue.Empty:
-            error_msg = f"GPU {gpu_id} 任务超时 (5分钟)"
+            error_msg = f"GPU {gpu_id} 获取结果超时 ({timeout}秒)"
             logger.error(error_msg)
             return {
                 "success": False,
@@ -943,9 +280,8 @@ class GPUIsolationManager:
                 "gpu_id": gpu_id
             }
         except Exception as e:
-            error_msg = f"提交任务到GPU {gpu_id} 失败: {str(e)}"
+            error_msg = f"从GPU {gpu_id} 获取结果失败: {str(e)}"
             logger.error(error_msg)
-            logger.error(f"错误详情: {traceback.format_exc()}")
             return {
                 "success": False,
                 "error": str(e),
