@@ -16,6 +16,23 @@ export PORT="12411"
 
 # 日志级别 (DEBUG, INFO, WARNING, ERROR)
 export LOG_LEVEL="INFO"
+# =============================================================================
+# API认证配置
+# =============================================================================
+
+# 默认API密钥（如果未配置其他密钥，将使用此密钥）
+export DEFAULT_API_KEY="genserve-default-key-2024"
+
+# API密钥配置（格式：key:name:permissions）
+# 支持最多10个API密钥
+export API_KEY_1="your-api-key-1:user1:generation,readonly"
+export API_KEY_2="your-api-key-2:user2:generation"
+export API_KEY_3="admin-key-2024:admin:all"
+
+# 示例密钥配置（请根据实际需要修改）
+# export API_KEY_1="abc123def456:developer:generation,readonly"
+# export API_KEY_2="xyz789ghi012:user:generation"
+# export API_KEY_3="admin123admin456:admin:all"
 
 # =============================================================================
 # GPU和设备配置

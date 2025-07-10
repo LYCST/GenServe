@@ -13,11 +13,13 @@ from contextlib import asynccontextmanager
 import base64
 import io
 import json
+from fastapi import Depends
 
 # 导入进程级并发管理器
 from models.process_concurrent_manager import ProcessConcurrentModelManager
 from config import Config
 from utils import ValidationUtils, ResponseUtils, GenerateResponse, TaskUtils
+from auth import get_api_key, require_generation, require_readonly, require_admin, AuthUtils
 
 # 配置日志
 logging.basicConfig(
@@ -111,12 +113,16 @@ async def file_to_base64(file: UploadFile) -> str:
         raise HTTPException(status_code=400, detail=f"文件处理失败: {str(e)}")
 
 @app.get("/")
-async def root():
+async def root(key_info: Dict = Depends(get_api_key)):
     """根路径"""
     return {
         "message": "GenServe - 多GPU图片生成服务",
         "version": "2.0.0",
         "status": "running",
+        "auth_info": {
+            "user": key_info["name"],
+            "permissions": key_info["permissions"]
+        },
         "endpoints": {
             "json_base64": "POST /generate",
             "form_data": "POST /generate/upload"
@@ -124,13 +130,13 @@ async def root():
     }
 
 @app.post("/generate", response_model=GenerateResponse)
-async def generate_image(request: GenerateRequest):
+async def generate_image(request: GenerateRequest, key_info: Dict = Depends(require_generation)):
     """生成图片 - JSON格式，支持base64编码的图片"""
     if not concurrent_manager:
         raise HTTPException(status_code=503, detail="服务未就绪")
     
     try:
-        logger.info(f"收到请求: {request.model_id}")
+        logger.info(f"收到请求: {request.model_id} (用户: {key_info['name']})")
         # 获取支持的模型列表
         supported_models_data = concurrent_manager.get_model_list()
         supported_model_ids = [model['model_id'] for model in supported_models_data]
@@ -209,13 +215,15 @@ async def generate_image_upload_general(
     controlnet_conditioning_scale: Optional[float] = Form(None),  # ControlNet条件强度
     control_guidance_start: Optional[float] = Form(None),  # ControlNet开始作用点
     control_guidance_end: Optional[float] = Form(None),  # ControlNet结束作用点
-    loras: Optional[str] = Form(None)  # JSON格式的LoRA配置
+    loras: Optional[str] = Form(None),  # JSON格式的LoRA配置
+    key_info: Dict = Depends(require_generation)
 ):
     """生成图片 - 通用Form-data格式，支持所有模式的文件上传"""
     if not concurrent_manager:
         raise HTTPException(status_code=503, detail="服务未就绪")
     
     try:
+        logger.info(f"收到文件上传请求: {model_id} (用户: {key_info['name']})")
         # 获取支持的模型列表
         supported_models_data = concurrent_manager.get_model_list()
         supported_model_ids = [model['model_id'] for model in supported_models_data]
@@ -226,35 +234,29 @@ async def generate_image_upload_general(
         control_image_base64 = None
         
         # 添加文件上传状态调试
+        logger.info(f"文件上传状态: input_image={input_image is not None}, mask_image={mask_image is not None}, control_image={control_image is not None}")
         
         if input_image:
-            logger.info(f"input_image详情: filename={input_image.filename}, content_type={input_image.content_type}")
             input_image_base64 = await file_to_base64(input_image)
-            logger.info(f"处理input_image: 文件大小={input_image.size if hasattr(input_image, 'size') else 'unknown'}")
+            logger.info(f"input_image处理完成，大小: {len(input_image_base64)}")
         
         if mask_image:
-            logger.info(f"mask_image详情: filename={mask_image.filename}, content_type={mask_image.content_type}")
             mask_image_base64 = await file_to_base64(mask_image)
-            logger.info(f"处理mask_image: 文件大小={mask_image.size if hasattr(mask_image, 'size') else 'unknown'}")
+            logger.info(f"mask_image处理完成，大小: {len(mask_image_base64)}")
         
         if control_image:
-            logger.info(f"control_image详情: filename={control_image.filename}, content_type={control_image.content_type}")
             control_image_base64 = await file_to_base64(control_image)
-            logger.info(f"处理control_image: 文件大小={control_image.size if hasattr(control_image, 'size') else 'unknown'}")
+            logger.info(f"control_image处理完成，大小: {len(control_image_base64)}")
         
-        
-        # 处理LoRA参数
-        loras_list = None
+        # 解析LoRA配置
+        loras_config = None
         if loras:
             try:
-                loras_list = json.loads(loras)
-                # 验证LoRA格式
-                if not isinstance(loras_list, list):
-                    raise ValueError("loras参数必须是列表格式")
-            except json.JSONDecodeError:
-                raise HTTPException(status_code=400, detail="loras参数必须是有效的JSON格式")
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
+                loras_config = json.loads(loras)
+                logger.info(f"LoRA配置解析成功: {loras_config}")
+            except json.JSONDecodeError as e:
+                logger.error(f"LoRA配置JSON解析失败: {e}")
+                raise HTTPException(status_code=400, detail=f"LoRA配置格式错误: {str(e)}")
         
         # 使用统一的验证工具
         ValidationUtils.validate_generation_request(
@@ -267,7 +269,7 @@ async def generate_image_upload_general(
             input_image=input_image_base64,
             mask_image=mask_image_base64,
             control_image=control_image_base64,
-            loras=loras_list,
+            loras=loras_config,
             supported_models=supported_model_ids
         )
         
@@ -287,7 +289,7 @@ async def generate_image_upload_general(
             controlnet_conditioning_scale=controlnet_conditioning_scale,
             control_guidance_start=control_guidance_start,
             control_guidance_end=control_guidance_end,
-            loras=loras_list
+            loras=loras_config
         )
         
         # 调用进程级并发管理器
@@ -312,16 +314,20 @@ async def generate_image_upload_general(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/status")
-async def get_status():
+async def get_status(key_info: Dict = Depends(require_readonly)):
     """获取服务状态"""
     if not concurrent_manager:
         raise HTTPException(status_code=503, detail="服务未就绪")
     
     status = concurrent_manager.get_status()
+    status["auth_info"] = {
+        "user": key_info["name"],
+        "permissions": key_info["permissions"]
+    }
     return status
 
 @app.get("/task/{task_id}")
-async def get_task_result(task_id: str):
+async def get_task_result(task_id: str, key_info: Dict = Depends(require_readonly)):
     """根据task_id查询任务结果"""
     if not concurrent_manager:
         raise HTTPException(status_code=503, detail="服务未就绪")
@@ -331,6 +337,13 @@ async def get_task_result(task_id: str):
         if not result:
             raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
         
+        # 添加认证信息
+        if isinstance(result, dict):
+            result["auth_info"] = {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        
         return result
     except HTTPException:
         raise
@@ -339,22 +352,33 @@ async def get_task_result(task_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/models")
-async def get_models():
+async def get_models(key_info: Dict = Depends(require_readonly)):
     """获取支持的模型列表"""
     if not concurrent_manager:
         raise HTTPException(status_code=503, detail="服务未就绪")
     
-    return concurrent_manager.get_model_list()
+    models = concurrent_manager.get_model_list()
+    return {
+        "models": models,
+        "auth_info": {
+            "user": key_info["name"],
+            "permissions": key_info["permissions"]
+        }
+    }
 
 @app.get("/loras")
-async def get_loras():
+async def get_loras(key_info: Dict = Depends(require_readonly)):
     """获取可用的LoRA列表"""
     try:
         loras = Config.get_lora_list()
         return {
             "success": True,
             "loras": loras,
-            "total": len(loras)
+            "total": len(loras),
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
         }
     except Exception as e:
         logger.error(f"获取LoRA列表失败: {e}")
@@ -362,20 +386,249 @@ async def get_loras():
             "success": False,
             "error": str(e),
             "loras": [],
-            "total": 0
+            "total": 0,
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
         }
 
 @app.get("/health")
-async def health_check():
+async def health_check(key_info: Dict = Depends(get_api_key)):
     """健康检查"""
     if not concurrent_manager:
-        return {"status": "unhealthy", "reason": "concurrent_manager_not_initialized"}
+        return {
+            "status": "unhealthy", 
+            "reason": "concurrent_manager_not_initialized",
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
     
     status = concurrent_manager.get_status()
     if status.get("is_running", False):
-        return {"status": "healthy"}
+        return {
+            "status": "healthy",
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
     else:
-        return {"status": "unhealthy", "reason": "concurrent_manager_not_running"}
+        return {
+            "status": "unhealthy", 
+            "reason": "concurrent_manager_not_running",
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+
+@app.get("/auth/keys")
+async def get_api_keys(key_info: Dict = Depends(require_admin)):
+    """获取API密钥列表（仅管理员）"""
+    try:
+        keys_info = AuthUtils.list_api_keys()
+        return {
+            "success": True,
+            "keys": keys_info,
+            "total": len(keys_info),
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+    except Exception as e:
+        logger.error(f"获取API密钥列表失败: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "keys": [],
+            "total": 0,
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+
+@app.post("/auth/generate-key")
+async def generate_new_api_key(
+    name: str = Form(...),
+    permissions: str = Form("generation"),  # 默认只有生成权限
+    key_info: Dict = Depends(require_admin)
+):
+    """生成新的API密钥（仅管理员）"""
+    try:
+        # 解析权限
+        permission_list = [p.strip() for p in permissions.split(",") if p.strip()]
+        
+        # 生成新密钥
+        new_key = AuthUtils.generate_api_key(name, permission_list)
+        
+        # 动态添加到认证管理器
+        from auth import auth_manager
+        success = auth_manager.add_api_key(new_key, name, permission_list)
+        
+        if not success:
+            return {
+                "success": False,
+                "error": "API密钥已存在或添加失败",
+                "auth_info": {
+                    "user": key_info["name"],
+                    "permissions": key_info["permissions"]
+                }
+            }
+        
+        # 生成配置字符串
+        config_string = f"{new_key}:{name}:{permissions}"
+        
+        return {
+            "success": True,
+            "api_key": new_key,
+            "name": name,
+            "permissions": permission_list,
+            "config_string": config_string,
+            "message": "API密钥已生成并添加到系统中，重启服务后仍可使用",
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+    except Exception as e:
+        logger.error(f"生成API密钥失败: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+
+@app.post("/auth/delete-key")
+async def delete_api_key(
+    api_key: str = Form(...),
+    key_info: Dict = Depends(require_admin)
+):
+    """删除API密钥（仅管理员）"""
+    try:
+        success = AuthUtils.remove_api_key(api_key)
+        
+        if success:
+            return {
+                "success": True,
+                "message": "API密钥已删除",
+                "auth_info": {
+                    "user": key_info["name"],
+                    "permissions": key_info["permissions"]
+                }
+            }
+        else:
+            return {
+                "success": False,
+                "error": "API密钥不存在或无法删除（环境变量中的密钥无法删除）",
+                "auth_info": {
+                    "user": key_info["name"],
+                    "permissions": key_info["permissions"]
+                }
+            }
+    except Exception as e:
+        logger.error(f"删除API密钥失败: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+
+@app.post("/auth/delete-key-by-name")
+async def delete_api_key_by_name(
+    name: str = Form(...),
+    key_info: Dict = Depends(require_admin)
+):
+    """通过用户名删除API密钥（仅管理员）"""
+    try:
+        result = AuthUtils.remove_api_key_by_name(name)
+        
+        return {
+            "success": result["success"],
+            "message": result.get("message", ""),
+            "error": result.get("error", ""),
+            "deleted_keys": result.get("deleted_keys", []),
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+    except Exception as e:
+        logger.error(f"通过用户名删除API密钥失败: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "deleted_keys": [],
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+
+@app.post("/auth/delete-key-by-id")
+async def delete_api_key_by_id(
+    key_id: str = Form(...),
+    key_info: Dict = Depends(require_admin)
+):
+    """通过key_id删除API密钥（仅管理员）"""
+    try:
+        result = AuthUtils.remove_api_key_by_id(key_id)
+        
+        return {
+            "success": result["success"],
+            "message": result.get("message", ""),
+            "error": result.get("error", ""),
+            "deleted_keys": result.get("deleted_keys", []),
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+    except Exception as e:
+        logger.error(f"通过key_id删除API密钥失败: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "deleted_keys": [],
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+
+@app.post("/auth/reload-keys")
+async def reload_api_keys(key_info: Dict = Depends(require_admin)):
+    """重新加载API密钥（仅管理员）"""
+    try:
+        AuthUtils.reload_api_keys()
+        return {
+            "success": True,
+            "message": "API密钥已重新加载",
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
+    except Exception as e:
+        logger.error(f"重新加载API密钥失败: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "auth_info": {
+                "user": key_info["name"],
+                "permissions": key_info["permissions"]
+            }
+        }
 
 if __name__ == "__main__":
     uvicorn.run(
