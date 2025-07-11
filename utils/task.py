@@ -46,12 +46,14 @@ class TaskUtils:
         cls,
         task_id: str,
         prompt: str,
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        model_id: str = "flux1-dev"
     ) -> Dict[str, Any]:
         """构建任务数据（用于GPU进程）"""
         return {
             "task_id": task_id,
             "prompt": prompt,
+            "model_id": model_id,  # 添加模型ID
             "height": params.get('height', 1024),
             "width": params.get('width', 1024),
             "cfg": params.get('cfg', 3.5),

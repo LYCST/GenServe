@@ -69,7 +69,7 @@ class ProcessConcurrentModelManager:
         self._start_manager()
     
     def _initialize_models(self):
-        """初始化模型进程"""
+        """初始化模型进程 - 懒加载模式，不预加载模型"""
         model_gpu_config = Config.get_config()["model_management"]["model_gpu_config"]
         model_paths = Config.get_config()["model_management"]["model_paths"]
         
@@ -87,27 +87,28 @@ class ProcessConcurrentModelManager:
             if model_id not in self.model_instances:
                 self.model_instances[model_id] = []
             
-            # 为每个GPU创建隔离进程
+            # 为每个GPU创建隔离进程（懒加载模式）
             for gpu_device in gpu_list:
                 if gpu_device.startswith("cuda:"):
                     gpu_id = gpu_device.split(":")[1]
                     
-                    # 创建GPU隔离进程
+                    # 创建GPU隔离进程（不预加载模型）
                     if self.gpu_manager.create_gpu_process(gpu_id, model_path, model_id):
                         self.model_instances[model_id].append(gpu_id)
-                        logger.info(f"✅ GPU {gpu_id} 进程创建成功 (模型: {model_id})")
+                        logger.info(f"物理GPU {gpu_id} 进程创建成功 (支持模型: {model_id})")
                     else:
-                        logger.error(f"❌ GPU {gpu_id} 进程创建失败 (模型: {model_id})")
+                        logger.error(f"物理GPU {gpu_id} 进程创建失败 (支持模型: {model_id})")
         
         # 打印初始化结果
         total_processes = sum(len(gpus) for gpus in self.model_instances.values())
         supported_models = list(self.model_instances.keys())
         
-        logger.info(f"🎉 模型进程初始化完成，总共创建了 {total_processes} 个GPU进程")
-        logger.info(f"📋 支持的模型: {supported_models}")
+        logger.info(f"模型进程初始化完成，总共创建了 {total_processes} 个物理GPU进程")
+        logger.info(f"支持的模型: {supported_models}")
+        logger.info(f"💡 懒加载模式：模型将在首次请求时加载")
         
         for model_id, gpus in self.model_instances.items():
-            logger.info(f"  {model_id}: {len(gpus)} 个GPU进程 ({gpus})")
+            logger.info(f"  {model_id}: {len(gpus)} 个物理GPU进程 ({gpus})")
     
     def _start_manager(self):
         """启动管理器"""
@@ -156,9 +157,9 @@ class ProcessConcurrentModelManager:
                     logger.info(f"进程监控: 检查了 {len(restart_results)} 个进程")
                     for process_key, success in restart_results.items():
                         if success:
-                            logger.info(f"✅ 进程 {process_key} 重启成功")
+                            logger.info(f"进程 {process_key} 重启成功")
                         else:
-                            logger.warning(f"⚠️ 进程 {process_key} 重启失败")
+                            logger.warning(f"进程 {process_key} 重启失败")
                 
             except Exception as e:
                 logger.error(f"进程监控循环错误: {e}")
@@ -177,7 +178,9 @@ class ProcessConcurrentModelManager:
                         
                         if result and 'task_id' in result:
                             task_id = result['task_id']
-                            logger.info(f"📨 结果监听器收到任务 {task_id[:8]} 的结果 (GPU: {result.get('gpu_id', 'unknown')})")
+                            gpu_id = result.get('gpu_id', 'unknown')
+                            model_id = result.get('model_id', 'unknown')
+                            logger.info(f"结果监听器收到任务 {task_id[:8]} 的结果 (物理GPU: {gpu_id})")
                             
                             # 查找对应的任务结果队列
                             if task_id in self.task_results:
@@ -188,33 +191,36 @@ class ProcessConcurrentModelManager:
                                 
                                 # 发送结果
                                 task_result_queue.put(result)
-                                logger.info(f"📤 任务 {task_id[:8]} 结果已发送到结果队列")
+                                logger.info(f"任务 {task_id[:8]} 结果已发送到结果队列")
                                 
                                 # 更新统计
                                 if result.get("success", False):
                                     self.stats["completed_tasks"] += 1
-                                    logger.info(f"✅ 任务 {task_id[:8]} 完成 (GPU: {result.get('gpu_id', 'unknown')})")
+                                    logger.info(f"任务 {task_id[:8]} 完成 (物理GPU: {gpu_id})")
                                 else:
                                     self.stats["failed_tasks"] += 1
                                     logger.error(f"❌ 任务 {task_id[:8]} 失败: {result.get('error', '未知错误')}")
+                                
+                                # 通知GPU管理器标记任务完成
+                                self.gpu_manager.mark_task_completed(gpu_id, model_id, task_id)
                                 
                                 # 清理任务记录
                                 del self.task_results[task_id]
                                 logger.debug(f"🧹 任务 {task_id[:8]} 记录已清理 (剩余任务数: {len(self.task_results)})")
                             else:
-                                logger.warning(f"⚠️ 未找到任务 {task_id[:8]} 的结果队列")
+                                logger.warning(f"未找到任务 {task_id[:8]} 的结果队列")
                         
                     except queue.Empty:
                         # 队列为空，继续检查下一个
                         continue
                     except Exception as e:
-                        logger.error(f"❌ 处理GPU {process_key} 结果时出错: {e}")
+                        logger.error(f"处理物理GPU {process_key} 结果时出错: {e}")
                 
                 # 短暂休眠，避免CPU占用过高，但保持响应性
                 time.sleep(0.05)  # 50ms，比原来的100ms更快
                 
             except Exception as e:
-                logger.error(f"❌ 结果监听器循环错误: {e}")
+                logger.error(f"结果监听器循环错误: {e}")
                 import traceback
                 logger.error(f"错误详情: {traceback.format_exc()}")
                 time.sleep(1.0)  # 出错时等待更长时间
@@ -232,25 +238,25 @@ class ProcessConcurrentModelManager:
                     # 队列为空，继续循环
                     continue
                 
-                logger.info(f"🎯 调度器获取到任务: {task.task_id[:8]}, 模型: {task.model_id}, 优先级: {task.priority}")
+                logger.info(f"调度器获取到任务: {task.task_id[:8]}, 模型: {task.model_id}")
                 
                 # 找到最佳的GPU进程
                 best_gpu_id = self._find_best_gpu(task.model_id)
                 
                 if best_gpu_id:
                     # 立即分配任务给GPU进程，不等待完成
-                    logger.info(f"🚀 调度器分配任务 {task.task_id[:8]} 到GPU {best_gpu_id}")
+                    logger.info(f"调度器分配任务 {task.task_id[:8]} 到物理GPU {best_gpu_id}")
                     self._submit_task_immediately(task, best_gpu_id)
-                    logger.info(f"✅ 任务 {task.task_id[:8]} 已分配给GPU {best_gpu_id}")
+                    logger.info(f"任务 {task.task_id[:8]} 已分配给物理GPU {best_gpu_id}")
                 else:
                     # 所有GPU都忙碌，重新放回队列（优先级保持不变）
-                    logger.warning(f"⚠️ 所有GPU都忙碌，任务 {task.task_id[:8]} 重新放回队列")
+                    logger.warning(f"所有GPU都忙碌，任务 {task.task_id[:8]} 重新放回队列")
                     self.global_task_queue.put(task)
                     # 短暂等待，避免CPU占用过高
                     time.sleep(self.scheduler_sleep_time * 2)
                     
             except Exception as e:
-                logger.error(f"❌ 全局调度器错误: {e}")
+                logger.error(f"全局调度器错误: {e}")
                 import traceback
                 logger.error(f"错误详情: {traceback.format_exc()}")
                 # 出错时短暂等待，避免无限循环
@@ -272,7 +278,7 @@ class ProcessConcurrentModelManager:
         if model_id not in self.gpu_round_robin_counters:
             self.gpu_round_robin_counters[model_id] = 0
         
-        logger.info(f"🔍 为模型 {model_id} 寻找可用GPU，可用GPU列表: {available_gpus}")
+        logger.debug(f"为模型 {model_id} 寻找可用GPU，可用GPU列表: {available_gpus}")
         
         # 尝试找到可用的GPU，最多检查所有GPU一次
         checked_count = 0
@@ -281,22 +287,22 @@ class ProcessConcurrentModelManager:
             gpu_index = self.gpu_round_robin_counters[model_id] % len(available_gpus)
             selected_gpu = available_gpus[gpu_index]
             
-            logger.info(f"🎲 轮询选择GPU {selected_gpu} (索引: {gpu_index}/{len(available_gpus)})")
+            logger.debug(f"轮询选择物理GPU {selected_gpu} (索引: {gpu_index}/{len(available_gpus)})")
             
             # 检查GPU是否可用
             if self._is_gpu_available(selected_gpu, model_id):
                 # 更新计数器
                 self.gpu_round_robin_counters[model_id] += 1
-                logger.info(f"✅ 负载均衡: 模型 {model_id} 选择GPU {selected_gpu} (索引: {gpu_index}/{len(available_gpus)})")
+                logger.debug(f"负载均衡: 模型 {model_id} 选择物理GPU {selected_gpu}")
                 return selected_gpu
             else:
                 # GPU不可用，尝试下一个
                 self.gpu_round_robin_counters[model_id] += 1
                 checked_count += 1
-                logger.info(f"❌ GPU {selected_gpu} 不可用，尝试下一个 (已检查: {checked_count}/{len(available_gpus)})")
+                logger.debug(f"物理GPU {selected_gpu} 不可用，尝试下一个 (已检查: {checked_count}/{len(available_gpus)})")
         
         # 所有GPU都不可用
-        logger.warning(f"⚠️ 模型 {model_id} 的所有GPU都不可用")
+        logger.warning(f"模型 {model_id} 的所有物理GPU都不可用")
         return None
     
     def _is_gpu_available(self, gpu_id: str, model_id: str) -> bool:
@@ -306,13 +312,13 @@ class ProcessConcurrentModelManager:
             
             # 检查进程是否存在
             if process_key not in self.gpu_manager.processes:
-                logger.debug(f"❌ GPU {gpu_id} 进程不存在 (key: {process_key})")
+                logger.debug(f"物理GPU {gpu_id} 进程不存在 (key: {process_key})")
                 return False
             
             # 检查进程是否活着
             process = self.gpu_manager.processes[process_key]
             if not process.is_alive():
-                logger.debug(f"❌ GPU {gpu_id} 进程已死亡 (PID: {process.pid}, exitcode: {process.exitcode})")
+                logger.debug(f"物理GPU {gpu_id} 进程已死亡 (PID: {process.pid}, exitcode: {process.exitcode})")
                 return False
             
             # 检查任务队列是否已满
@@ -324,31 +330,31 @@ class ProcessConcurrentModelManager:
                     max_queue_size = 5  # 每个GPU队列最大大小
                     
                     if queue_size >= max_queue_size:
-                        logger.debug(f"❌ GPU {gpu_id} 任务队列已满 (大小: {queue_size}/{max_queue_size})")
+                        logger.debug(f"物理GPU {gpu_id} 任务队列已满 (大小: {queue_size}/{max_queue_size})")
                         return False
                     else:
-                        logger.debug(f"✅ GPU {gpu_id} 可用 (队列大小: {queue_size}/{max_queue_size})")
+                        logger.debug(f"物理GPU {gpu_id} 可用 (队列大小: {queue_size}/{max_queue_size})")
                         return True
                         
                 except Exception as e:
                     # 如果无法获取队列大小，假设可用
-                    logger.debug(f"✅ GPU {gpu_id} 可用 (无法获取队列大小: {e})")
+                    logger.debug(f"物理GPU {gpu_id} 可用 (无法获取队列大小: {e})")
                     return True
             else:
-                logger.debug(f"❌ GPU {gpu_id} 任务队列不存在")
+                logger.debug(f"物理GPU {gpu_id} 任务队列不存在")
                 return False
             
         except Exception as e:
-            logger.debug(f"❌ 检查GPU {gpu_id} 可用性时出错: {e}")
+            logger.debug(f"检查物理GPU {gpu_id} 可用性时出错: {e}")
             return False
     
     def _submit_task_immediately(self, task: GenerationTask, gpu_id: str):
         """异步提交任务到GPU进程，不阻塞调度器"""
-        logger.info(f"📤 开始提交任务 {task.task_id[:8]} 到GPU {gpu_id}")
+        logger.info(f"开始提交任务 {task.task_id[:8]} 到物理GPU {gpu_id}")
         
         # 存储任务结果队列，供结果监听器使用
         self.task_results[task.task_id] = task.result_queue
-        logger.info(f"💾 任务 {task.task_id[:8]} 结果队列已存储 (当前任务数: {len(self.task_results)})")
+        logger.debug(f"任务 {task.task_id[:8]} 结果队列已存储 (当前任务数: {len(self.task_results)})")
         
         # 创建后台线程处理任务，不阻塞调度器
         thread = threading.Thread(
@@ -358,32 +364,33 @@ class ProcessConcurrentModelManager:
         )
         thread.daemon = True
         thread.start()
-        logger.info(f"🧵 任务 {task.task_id[:8]} 后台线程已启动 (线程名: {thread.name})")
-        logger.info(f"✅ 任务 {task.task_id[:8]} 已异步提交到GPU {gpu_id}")
+        logger.debug(f"任务 {task.task_id[:8]} 后台线程已启动")
+        logger.info(f"任务 {task.task_id[:8]} 已异步提交到物理GPU {gpu_id}")
     
     def _process_task_on_gpu_process(self, task: GenerationTask, gpu_id: str):
         """在后台线程中处理GPU任务 - 真正的异步处理"""
-        logger.info(f"⚙️ 后台线程开始处理任务 {task.task_id[:8]} (GPU: {gpu_id}, 线程: {threading.current_thread().name})")
+        logger.debug(f"后台线程开始处理任务 {task.task_id[:8]} (物理GPU: {gpu_id})")
         
         try:
             # 使用统一的任务数据构建工具
             task_data = TaskUtils.build_task_data(
                 task_id=task.task_id,
                 prompt=task.prompt,
-                params=task.params
+                params=task.params,
+                model_id=task.model_id  # 传递模型ID
             )
-            logger.info(f"📋 任务 {task.task_id[:8]} 数据已构建，准备提交到GPU进程")
+            logger.debug(f"任务 {task.task_id[:8]} 数据已构建，模型: {task.model_id}，准备提交到GPU进程")
             
             # 提交任务到GPU进程，不等待结果
             submit_success = self.gpu_manager.submit_task(gpu_id, task.model_id, task_data)
             
             if submit_success:
-                logger.info(f"🎯 任务 {task.task_id[:8]} 已成功提交到GPU {gpu_id} 进程，等待异步结果")
+                logger.debug(f"任务 {task.task_id[:8]} 已成功提交到物理GPU {gpu_id} 进程，等待异步结果")
                 # 不在这里等待结果，让GPU进程异步处理
                 # 结果会通过GPU进程的结果队列返回
             else:
                 # 任务提交失败，立即返回错误
-                logger.error(f"❌ 任务 {task.task_id[:8]} 提交到GPU {gpu_id} 失败")
+                logger.error(f"❌ 任务 {task.task_id[:8]} 提交到物理GPU {gpu_id} 失败")
                 error_result = {
                     "success": False,
                     "error": "GPU进程不可用或队列已满",
@@ -410,7 +417,7 @@ class ProcessConcurrentModelManager:
             task.result_queue.put(error_result)
             self.stats["failed_tasks"] += 1
         
-        logger.info(f"🏁 后台线程完成处理任务 {task.task_id[:8]} (GPU: {gpu_id})")
+        logger.debug(f"后台线程完成处理任务 {task.task_id[:8]} (物理GPU: {gpu_id})")
     
     async def generate_image_async(
         self, 
@@ -496,8 +503,8 @@ class ProcessConcurrentModelManager:
             priority=priority
         )
         
-        logger.info(f"🔄 创建任务: {task_id[:8]}, 模型: {model_id}, 模式: {mode}, 优先级: {priority}")
-        logger.info(f"📝 任务详情: 提示词='{prompt[:50]}{'...' if len(prompt) > 50 else ''}', 参数={task_params}")
+        logger.info(f"创建任务: {task_id[:8]}, 模型: {model_id}, 模式: {mode}")
+        logger.debug(f"任务详情: 提示词='{prompt[:50]}{'...' if len(prompt) > 50 else ''}', 参数={task_params}")
         
         # 检查全局队列是否过载
         if self.global_task_queue.qsize() >= self.max_global_queue_size:
@@ -514,7 +521,7 @@ class ProcessConcurrentModelManager:
         try:
             self.global_task_queue.put(task)
             self.stats["total_tasks"] += 1
-            logger.info(f"📥 任务 {task_id[:8]} 已提交到全局队列 (队列大小: {self.global_task_queue.qsize()})")
+            logger.info(f"任务 {task_id[:8]} 已提交到全局队列")
         except Exception as e:
             logger.error(f"❌ 提交任务 {task_id[:8]} 到全局队列失败: {e}")
             return {
@@ -533,7 +540,7 @@ class ProcessConcurrentModelManager:
                 lambda: result_queue.get(timeout=self.task_timeout)
             )
             
-            logger.info(f"✅ 任务 {task_id[:8]} 完成: {result.get('success', False)}")
+            logger.info(f"任务 {task_id[:8]} 完成: {result.get('success', False)}")
             
             # 添加任务ID到结果
             result["task_id"] = task_id

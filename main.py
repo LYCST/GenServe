@@ -155,7 +155,7 @@ async def generate_image(request: GenerateRequest, key_info: Dict = Depends(requ
             loras=request.loras,
             supported_models=supported_model_ids
         )
-        logger.info(f"构建任务参数")
+        logger.debug(f"构建任务参数")
         # 构建任务参数
         task_params = TaskUtils.build_task_params(
             height=request.height,
@@ -174,7 +174,7 @@ async def generate_image(request: GenerateRequest, key_info: Dict = Depends(requ
             control_guidance_end=request.control_guidance_end,
             loras=request.loras
         )
-        logger.info(f"调用进程级并发管理器")
+        logger.debug(f"调用进程级并发管理器")
         # 调用进程级并发管理器
         result = await concurrent_manager.generate_image_async(
             model_id=request.model_id,
@@ -182,7 +182,7 @@ async def generate_image(request: GenerateRequest, key_info: Dict = Depends(requ
             priority=request.priority,
             **task_params
         )
-        logger.info(f"构建响应")
+        logger.debug(f"构建响应")
         # 使用统一的响应构建工具
         return ResponseUtils.build_generation_response(
             result=result,
@@ -234,26 +234,26 @@ async def generate_image_upload_general(
         control_image_base64 = None
         
         # 添加文件上传状态调试
-        logger.info(f"文件上传状态: input_image={input_image is not None}, mask_image={mask_image is not None}, control_image={control_image is not None}")
+        logger.debug(f"文件上传状态: input_image={input_image is not None}, mask_image={mask_image is not None}, control_image={control_image is not None}")
         
         if input_image:
             input_image_base64 = await file_to_base64(input_image)
-            logger.info(f"input_image处理完成，大小: {len(input_image_base64)}")
+            logger.debug(f"input_image处理完成，大小: {len(input_image_base64)}")
         
         if mask_image:
             mask_image_base64 = await file_to_base64(mask_image)
-            logger.info(f"mask_image处理完成，大小: {len(mask_image_base64)}")
+            logger.debug(f"mask_image处理完成，大小: {len(mask_image_base64)}")
         
         if control_image:
             control_image_base64 = await file_to_base64(control_image)
-            logger.info(f"control_image处理完成，大小: {len(control_image_base64)}")
+            logger.debug(f"control_image处理完成，大小: {len(control_image_base64)}")
         
         # 解析LoRA配置
         loras_config = None
         if loras:
             try:
                 loras_config = json.loads(loras)
-                logger.info(f"LoRA配置解析成功: {loras_config}")
+                logger.debug(f"LoRA配置解析成功: {loras_config}")
             except json.JSONDecodeError as e:
                 logger.error(f"LoRA配置JSON解析失败: {e}")
                 raise HTTPException(status_code=400, detail=f"LoRA配置格式错误: {str(e)}")

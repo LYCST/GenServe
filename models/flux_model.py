@@ -48,7 +48,7 @@ class FluxModel(BaseModel):
             gpu_device=gpu_device
         )
         self.model_path = _safe_path(Config.get_model_paths().get(model_id))
-        self.physical_gpu_id = self._extract_gpu_id(gpu_device)
+        self.physical_gpu_id = physical_gpu_id
         self._generation_lock = threading.Lock()
         self._instance_id = f"{model_id}_{gpu_device}_{id(self)}"
         self.pipelines: Dict[str, Union[None, dict, Callable[..., Any]]] = {
@@ -97,6 +97,12 @@ class FluxModel(BaseModel):
                     use_safetensors=True,
                     local_files_only=True
                 )
+                # 启用CPU offload
+                pipe_obj = self.pipelines[pipeline_type]
+                if pipe_obj is not None and not isinstance(pipe_obj, dict) and hasattr(pipe_obj, "enable_model_cpu_offload"):
+                    pipe_obj.enable_model_cpu_offload(device="cuda:0")
+                    logger.info(f"text2img pipeline CPU offload已启用")
+                
             elif pipeline_type == "img2img":
                 base_model_path = _safe_path(model_paths.get("flux1-dev"), self.model_path)
                 self.pipelines[pipeline_type] = None
@@ -106,6 +112,12 @@ class FluxModel(BaseModel):
                     use_safetensors=True,
                     local_files_only=True
                 )
+                # 启用CPU offload
+                pipe_obj = self.pipelines[pipeline_type]
+                if pipe_obj is not None and not isinstance(pipe_obj, dict) and hasattr(pipe_obj, "enable_model_cpu_offload"):
+                    pipe_obj.enable_model_cpu_offload(device="cuda:0")
+                    logger.info(f"img2img pipeline CPU offload已启用")
+                
             elif pipeline_type == "fill":
                 fill_model_path = _safe_path(model_paths.get("flux1-fill-dev"), self.model_path)
                 if not os.path.exists(fill_model_path):
@@ -118,6 +130,12 @@ class FluxModel(BaseModel):
                     use_safetensors=True,
                     local_files_only=True
                 )
+                # 启用CPU offload
+                pipe_obj = self.pipelines[pipeline_type]
+                if pipe_obj is not None and not isinstance(pipe_obj, dict) and hasattr(pipe_obj, "enable_model_cpu_offload"):
+                    pipe_obj.enable_model_cpu_offload(device="cuda:0")
+                    logger.info(f"fill pipeline CPU offload已启用")
+                
             elif pipeline_type.startswith("controlnet_"):
                 controlnet_type = pipeline_type.split("_")[1]
                 if controlnet_type == 'depth':
@@ -138,6 +156,12 @@ class FluxModel(BaseModel):
                     use_safetensors=True,
                     local_files_only=True
                 )
+                # 启用CPU offload
+                pipe_obj = self.pipelines[pipeline_type]
+                if pipe_obj is not None and not isinstance(pipe_obj, dict) and hasattr(pipe_obj, "enable_model_cpu_offload"):
+                    pipe_obj.enable_model_cpu_offload(device="cuda:0")
+                    logger.info(f"controlnet {controlnet_type} pipeline CPU offload已启用")
+                
             elif pipeline_type == "redux":
                 redux_model_path = _safe_path(model_paths.get("flux1-redux-dev"), self.model_path)
                 base_model_path = _safe_path(model_paths.get("flux1-dev"), self.model_path)
@@ -160,28 +184,30 @@ class FluxModel(BaseModel):
                     local_files_only=True
                 )
                 self.pipelines[pipeline_type] = {"prior": prior, "base": base}
+                # 为redux的两个pipeline都启用CPU offload
                 if self.pipelines[pipeline_type] is not None and isinstance(self.pipelines[pipeline_type], dict):
                     prior_obj = self.pipelines[pipeline_type].get("prior")
                     base_obj = self.pipelines[pipeline_type].get("base")
                     if prior_obj is not None and hasattr(prior_obj, "enable_model_cpu_offload"):
                         prior_obj.enable_model_cpu_offload(device="cuda:0")
+                        logger.info(f"redux prior pipeline CPU offload已启用")
                     if base_obj is not None and hasattr(base_obj, "enable_model_cpu_offload"):
                         base_obj.enable_model_cpu_offload(device="cuda:0")
+                        logger.info(f"redux base pipeline CPU offload已启用")
                 logger.info(f"Redux pipeline加载完成")
                 return True
+                
+            # 检查pipeline是否成功加载
             if self.pipelines[pipeline_type]:
-                if isinstance(self.pipelines[pipeline_type], dict):
-                    pass
-                else:
-                    pipe_obj = self.pipelines[pipeline_type]
-                    if pipe_obj is not None and hasattr(pipe_obj, "enable_model_cpu_offload"):
-                        pipe_obj.enable_model_cpu_offload(device="cuda:0")
                 logger.info(f"成功加载 {pipeline_type} pipeline")
                 return True
+            else:
+                logger.error(f"{pipeline_type} pipeline 加载失败")
+                return False
+                
         except Exception as e:
             logger.error(f"加载 {pipeline_type} pipeline失败: {e}")
             return False
-        return False
     
     def _get_pipeline(self, pipeline_type: str):
         pipe = self.pipelines.get(pipeline_type)
@@ -344,7 +370,7 @@ class FluxModel(BaseModel):
             else:
                 device = "cpu"
             generation_mode = params.get('mode', 'text2img')
-            logger.info(f"开始{generation_mode}生成，提示词: {prompt}，设备: {device}")
+            logger.info(f"开始{generation_mode}生成，设备: {device}")
             with torch.no_grad():
                 if generation_mode == 'text2img':
                     result = self._generate_text2img(prompt, params, generator)
@@ -488,7 +514,7 @@ class FluxModel(BaseModel):
         control_image = self._load_image(params.get('control_image'))
         width, height = self._get_output_dimensions(control_image, 'controlnet', params)
         if params.get('input_image'):
-            logger.info(f"ControlNet模式检测到input_image，但主要使用control_image")
+            logger.debug(f"ControlNet模式检测到input_image，但主要使用control_image")
         controlnet_kwargs = {
             'prompt': prompt,
             'control_image': control_image,
@@ -500,11 +526,11 @@ class FluxModel(BaseModel):
             'generator': generator
         }
         if params.get('controlnet_conditioning_scale') is not None:
-            logger.info(f"用户提供了controlnet_conditioning_scale: {params.get('controlnet_conditioning_scale')}，但FluxControlPipeline不支持此参数")
+            logger.debug(f"用户提供了controlnet_conditioning_scale参数，但FluxControlPipeline不支持此参数")
         if params.get('control_guidance_start') is not None:
-            logger.info(f"用户提供了control_guidance_start: {params.get('control_guidance_start')}，但FluxControlPipeline不支持此参数")
+            logger.debug(f"用户提供了control_guidance_start参数，但FluxControlPipeline不支持此参数")
         if params.get('control_guidance_end') is not None:
-            logger.info(f"用户提供了control_guidance_end: {params.get('control_guidance_end')}，但FluxControlPipeline不支持此参数")
+            logger.debug(f"用户提供了control_guidance_end参数，但FluxControlPipeline不支持此参数")
         if not callable(pipe):
             raise RuntimeError("controlnet pipeline 未加载")
         return pipe(**controlnet_kwargs)
@@ -513,7 +539,7 @@ class FluxModel(BaseModel):
         pipe = self._get_pipeline("redux")
         input_image = self._load_image(params.get('input_image'))
         width, height = self._get_output_dimensions(input_image, 'redux', params)
-        logger.info(f"开始Redux处理，输入图片尺寸: {input_image.size}")
+        logger.debug(f"开始Redux处理，输入图片尺寸: {input_image.size}")
         if not isinstance(pipe, dict) or 'prior' not in pipe or 'base' not in pipe:
             raise RuntimeError("redux pipeline 未正确加载")
         prior_obj = pipe.get("prior")
@@ -521,16 +547,16 @@ class FluxModel(BaseModel):
         if not callable(prior_obj) or not callable(base_obj):
             raise RuntimeError("redux pipeline 的 prior/base 未正确加载")
         try:
-            logger.info(f"运行Redux prior pipeline...")
+            logger.debug(f"运行Redux prior pipeline...")
             prior_output = prior_obj(input_image)
-            logger.info(f"运行Redux base pipeline...")
+            logger.debug(f"运行Redux base pipeline...")
             result = base_obj(
                 guidance_scale=params['cfg'],
                 num_inference_steps=params['num_inference_steps'],
                 generator=generator,
                 **prior_output
             )
-            logger.info(f"Redux处理完成")
+            logger.debug(f"Redux处理完成")
             return result
         except Exception as e:
             logger.error(f"Redux处理失败: {e}")
@@ -541,7 +567,7 @@ class FluxModel(BaseModel):
             if not self.model_path or not os.path.exists(self.model_path):
                 logger.error(f"模型路径不存在: {self.model_path}")
                 return False
-            logger.info(f"正在加载模型: {self.model_name}，物理GPU: {self.physical_gpu_id}")
+            logger.info(f"正在加载模型: {self.model_name}")
             
             # 在GPU工作进程中，CUDA_VISIBLE_DEVICES已经设置，不需要再次设置
             if self.physical_gpu_id != "cpu":
@@ -550,7 +576,7 @@ class FluxModel(BaseModel):
                     return False
                 if self._load_pipeline("text2img"):
                     self.is_loaded = True
-                    logger.info(f"FluxPipeline加载成功，使用物理GPU {self.physical_gpu_id}")
+                    logger.info(f"FluxPipeline加载成功")
                     return True
                 else:
                     return False
@@ -633,7 +659,7 @@ class FluxModel(BaseModel):
                 self._safe_pipeline_cleanup()
                 gc.collect()
                 torch.cuda.empty_cache()
-            logger.info("紧急清理完成")
+                logger.info("紧急清理完成")
         except Exception as e:
             logger.error(f"紧急清理时出错: {e}")
     
@@ -641,7 +667,7 @@ class FluxModel(BaseModel):
         try:
             for name, pipeline in self.pipelines.items():
                 if pipeline is not None:
-                    logger.info(f"开始清理pipeline组件 (实例: {self._instance_id})")
+                    logger.debug(f"开始清理pipeline组件 (实例: {self._instance_id})")
                     if isinstance(pipeline, dict):
                         for sub_name in list(pipeline.keys()):
                             sub_pipeline = pipeline[sub_name]
@@ -650,7 +676,7 @@ class FluxModel(BaseModel):
                     else:
                         self._cleanup_single_pipeline(pipeline, name)
                     self.pipelines[name] = None
-                    logger.info(f"Pipeline {name} 已删除 (实例: {self._instance_id})")
+                    logger.debug(f"Pipeline {name} 已删除 (实例: {self._instance_id})")
         except Exception as e:
             logger.error(f"清理pipeline时出错: {e}")
     
@@ -710,4 +736,4 @@ class FluxModel(BaseModel):
                 except Exception as e:
                     logger.error(f"卸载模型时出错: {e}")
         self.pipelines = {key: None for key in self.pipelines}
-        logger.info(f"模型 {self.model_id} 已卸载 (物理GPU: {self.physical_gpu_id})") 
+        logger.info(f"模型 {self.model_id} 已卸载") 

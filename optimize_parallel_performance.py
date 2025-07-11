@@ -29,7 +29,7 @@ class ParallelPerformanceOptimizer:
     
     async def test_parallel_performance(self, num_requests: int = 20, batch_size: int = 5):
         """测试并行性能"""
-        logger.info(f"🚀 开始并行性能测试: {num_requests}个请求，批次大小: {batch_size}")
+        logger.info(f"开始并行性能测试: {num_requests}个请求，批次大小: {batch_size}")
         
         # 生成测试提示词
         prompts = [
@@ -110,7 +110,7 @@ class ParallelPerformanceOptimizer:
                             result["gpu_id"] = response_json.get("gpu_id", "")
                             result["model_id"] = response_json.get("model_id", "")
                             result["elapsed_time"] = response_json.get("elapsed_time", 0)
-                            logger.info(f"请求 {request_id}: ✅ 成功，GPU: {result['gpu_id']}, 耗时: {response_time:.2f}s")
+                            logger.info(f"请求 {request_id}: 成功，物理GPU: {result['gpu_id']}, 耗时: {response_time:.2f}s")
                         except:
                             logger.warning(f"请求 {request_id}: 响应解析失败")
                     else:
@@ -172,10 +172,10 @@ class ParallelPerformanceOptimizer:
                 gpu_id = r.get("gpu_id", "unknown")
                 gpu_usage[gpu_id] = gpu_usage.get(gpu_id, 0) + 1
             
-            logger.info(f"\n🎮 GPU使用情况:")
+            logger.info(f"\n物理GPU使用情况:")
             for gpu_id, count in sorted(gpu_usage.items()):
                 percentage = count / len(valid_results) * 100
-                logger.info(f"  GPU {gpu_id}: {count} 个请求 ({percentage:.1f}%)")
+                logger.info(f"  物理GPU {gpu_id}: {count} 个请求 ({percentage:.1f}%)")
             
             # 负载均衡评估
             if len(gpu_usage) > 1:
@@ -187,11 +187,11 @@ class ParallelPerformanceOptimizer:
                 logger.info(f"\n⚖️ 负载均衡评估:")
                 logger.info(f"  均衡度评分: {balance_score:.3f} (1.0为完美均衡)")
                 if balance_score > 0.8:
-                    logger.info(f"  ✅ 负载均衡效果优秀")
+                    logger.info(f"  负载均衡效果优秀")
                 elif balance_score > 0.6:
-                    logger.info(f"  ⚠️ 负载均衡效果良好")
+                    logger.info(f"  负载均衡效果良好")
                 else:
-                    logger.info(f"  ❌ 负载均衡效果需要改进")
+                    logger.info(f"  负载均衡效果需要改进")
             
             # 并发效率评估
             avg_response_time = statistics.mean(response_times)
@@ -203,11 +203,11 @@ class ParallelPerformanceOptimizer:
             logger.info(f"  实际并发度: {concurrent_efficiency:.1f}")
             
             if concurrent_efficiency > len(valid_results) * 0.8:
-                logger.info(f"  ✅ 并发效率优秀")
+                logger.info(f"  并发效率优秀")
             elif concurrent_efficiency > len(valid_results) * 0.6:
-                logger.info(f"  ⚠️ 并发效率良好")
+                logger.info(f"  并发效率良好")
             else:
-                logger.info(f"  ❌ 并发效率需要改进")
+                logger.info(f"  并发效率需要改进")
         
         # 优化建议
         self._provide_optimization_suggestions(valid_results, total_time)

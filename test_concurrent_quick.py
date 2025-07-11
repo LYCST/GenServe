@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 async def test_concurrent_requests(base_url: str = "http://localhost:12411", total_requests: int = 10):
     """测试并发请求"""
-    logger.info(f"🚀 开始快速并发测试")
+    logger.info(f"开始快速并发测试")
     logger.info(f"   总请求数: {total_requests}")
     logger.info(f"   服务地址: {base_url}")
     
@@ -69,7 +69,7 @@ async def test_concurrent_requests(base_url: str = "http://localhost:12411", tot
             else:
                 valid_results.append(result)
         
-        logger.info(f"✅ 并发测试完成，总耗时: {overall_time:.2f}s")
+        logger.info(f"并发测试完成，总耗时: {overall_time:.2f}s")
         
         # 分析结果
         analyze_concurrent_results(valid_results, overall_time, start_times)
@@ -97,7 +97,7 @@ async def test_single_request(session: aiohttp.ClientSession, request_id: int, b
                     result["task_id"] = response_json.get("task_id", "")
                     result["gpu_id"] = response_json.get("gpu_id", "")
                     result["model_id"] = response_json.get("model_id", "")
-                    logger.info(f"请求 {request_id}: ✅ 成功，GPU: {result['gpu_id']}, 耗时: {response_time:.2f}s")
+                    logger.info(f"请求 {request_id}: 成功，物理GPU: {result['gpu_id']}, 耗时: {response_time:.2f}s")
                 except:
                     logger.warning(f"请求 {request_id}: 响应解析失败")
             else:
@@ -171,9 +171,9 @@ def analyze_concurrent_results(results: List[Dict[str, Any]], overall_time: floa
     else:
         logger.warning("⚠️ 响应时间差异较大，可能存在负载不均衡")
     
-    logger.info("\n🎮 GPU使用情况:")
+    logger.info("\n物理GPU使用情况:")
     for gpu_id, count in sorted(gpu_usage.items()):
-        logger.info(f"  GPU {gpu_id}: {count} 个请求")
+        logger.info(f"  物理GPU {gpu_id}: {count} 个请求")
     
     # 检查负载均衡
     if len(gpu_usage) > 1:

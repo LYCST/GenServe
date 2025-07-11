@@ -10,6 +10,7 @@ import traceback
 import queue
 import gc
 import psutil
+import threading
 
 # mp.set_start_method('spawn', force=True)
 
@@ -27,50 +28,100 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
 
     logger = logging.getLogger(f"gpu_worker_{gpu_id}")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-    model = None
+    
+    # 模型管理
+    current_model = None
+    current_model_id = None
+    
     try:
-        # 在GPU工作进程中，由于设置了CUDA_VISIBLE_DEVICES，只能看到GPU 0
-        # 所以使用cuda:0而不是cuda:{gpu_id}
-        model = FluxModel(model_id=model_id, gpu_device="cuda:0", physical_gpu_id=gpu_id)
-        if not model.load():
-            logger.error(f"模型加载失败: {model_id} on GPU {gpu_id}")
-            result_queue.put({"success": False, "error": f"模型加载失败: {model_id}", "gpu_id": gpu_id})
-            return
-        logger.info(f"模型 {model_id} 已加载到GPU {gpu_id}")
+        logger.info(f"物理GPU {gpu_id} 工作进程启动，等待任务...")
+        
         while True:
             try:
                 task = task_queue.get(timeout=1.0)
                 if task is None:
-                    logger.info(f"GPU {gpu_id} 收到退出信号")
+                    logger.info(f"物理GPU {gpu_id} 收到退出信号")
                     break
                 
                 task_id = task.get('task_id', 'unknown')
-                logger.info(f"🎯 GPU {gpu_id} 进程接收到任务: {task_id[:8]}")
-                logger.info(f"📋 任务详情: 提示词='{task.get('prompt', '')[:50]}{'...' if len(task.get('prompt', '')) > 50 else ''}', 模式={task.get('mode', 'unknown')}")
+                task_model_id = task.get('model_id', model_id)  # 从任务中获取模型ID
+                logger.info(f"物理GPU {gpu_id} 进程接收到任务: {task_id[:8]}, 模型: {task_model_id}")
+                logger.debug(f"任务详情: 提示词='{task.get('prompt', '')[:50]}{'...' if len(task.get('prompt', '')) > 50 else ''}', 模式={task.get('mode', 'unknown')}")
                 
                 try:
-                    logger.info(f"🚀 GPU {gpu_id} 开始处理任务: {task_id[:8]}")
-                    result = model.generate(**task)
+                    # 检查是否需要切换模型
+                    if current_model_id != task_model_id:
+                        logger.info(f"物理GPU {gpu_id} 需要切换模型: {current_model_id} -> {task_model_id}")
+                        
+                        # 卸载当前模型
+                        if current_model is not None:
+                            logger.info(f"物理GPU {gpu_id} 卸载当前模型: {current_model_id}")
+                            current_model.unload()
+                            current_model = None
+                            current_model_id = None
+                            gc.collect()
+                            logger.info(f"物理GPU {gpu_id} 模型卸载完成，内存清理完成")
+                        
+                        # 加载新模型
+                        logger.info(f"物理GPU {gpu_id} 开始加载新模型: {task_model_id}")
+                        current_model = FluxModel(model_id=task_model_id, gpu_device="cuda:0", physical_gpu_id=gpu_id)
+                        
+                        if not current_model.load():
+                            error_msg = f"模型加载失败: {task_model_id} on GPU {gpu_id}"
+                            logger.error(error_msg)
+                            error_result = {
+                                "success": False,
+                                "error": error_msg,
+                                "task_id": task_id,
+                                "gpu_id": gpu_id,
+                                "model_id": task_model_id
+                            }
+                            result_queue.put(error_result)
+                            continue
+                        
+                        current_model_id = task_model_id
+                        logger.info(f"物理GPU {gpu_id} 模型 {task_model_id} 加载成功")
+                    
+                    # 确保模型已加载
+                    if current_model is None:
+                        error_msg = f"模型未加载: {task_model_id}"
+                        logger.error(error_msg)
+                        error_result = {
+                            "success": False,
+                            "error": error_msg,
+                            "task_id": task_id,
+                            "gpu_id": gpu_id,
+                            "model_id": task_model_id
+                        }
+                        result_queue.put(error_result)
+                        continue
+                    
+                    # 处理任务
+                    logger.info(f"物理GPU {gpu_id} 开始处理任务: {task_id[:8]} (模型: {current_model_id})")
+                    result = current_model.generate(**task)
                     result['task_id'] = task_id
                     result['gpu_id'] = gpu_id
-                    logger.info(f"✅ GPU {gpu_id} 任务 {task_id[:8]} 处理完成，准备发送结果")
+                    result['model_id'] = current_model_id
+                    logger.info(f"物理GPU {gpu_id} 任务 {task_id[:8]} 处理完成")
                     result_queue.put(result)
-                    logger.info(f"📤 GPU {gpu_id} 任务 {task_id[:8]} 结果已发送到结果队列")
+                    logger.debug(f"物理GPU {gpu_id} 任务 {task_id[:8]} 结果已发送到结果队列")
+                    
                 except Exception as e:
-                    logger.error(f"❌ GPU {gpu_id} 模型推理异常: {e}")
+                    logger.error(f"物理GPU {gpu_id} 模型推理异常: {e}")
                     logger.error(traceback.format_exc())
                     error_result = {
                         "success": False,
                         "error": str(e),
                         "task_id": task_id,
-                        "gpu_id": gpu_id
+                        "gpu_id": gpu_id,
+                        "model_id": task_model_id
                     }
                     result_queue.put(error_result)
-                    logger.error(f"📤 GPU {gpu_id} 任务 {task_id[:8]} 错误结果已发送")
+                    logger.debug(f"物理GPU {gpu_id} 任务 {task_id[:8]} 错误结果已发送")
                 
                 # 推理后可选清理
                 gc.collect()
-                logger.info(f"🧹 GPU {gpu_id} 任务 {task_id[:8]} 内存清理完成")
+                logger.debug(f"物理GPU {gpu_id} 任务 {task_id[:8]} 内存清理完成")
                 
             except queue.Empty:
                 continue
@@ -79,9 +130,14 @@ def gpu_worker_process(gpu_id: str, model_path: str, model_id: str, task_queue, 
                 logger.error(traceback.format_exc())
                 break
     finally:
-        if model is not None:
-            model.unload()
-        logger.info(f"GPU {gpu_id} 工作进程退出")
+        # 清理当前模型
+        if current_model is not None:
+            logger.info(f"物理GPU {gpu_id} 清理模型: {current_model_id}")
+            current_model.unload()
+            current_model = None
+            current_model_id = None
+            gc.collect()
+        logger.info(f"物理GPU {gpu_id} 工作进程退出")
 
 class GPUIsolationManager:
     """GPU隔离管理器 - 使用子进程实现真正的GPU隔离"""
@@ -94,6 +150,10 @@ class GPUIsolationManager:
         self.is_running = True
         self.restart_attempts: Dict[str, int] = {}  # 记录重启次数
         self.max_restart_attempts = 3  # 最大重启次数
+        
+        # 任务跟踪
+        self.active_tasks: Dict[str, Dict[str, Any]] = {}  # process_key -> {task_id: task_data}
+        self.task_lock = threading.Lock()  # 线程锁保护任务跟踪
     
     def create_gpu_process(self, gpu_id: str, model_path: str, model_id: str) -> bool:
         """为指定GPU创建隔离进程"""
@@ -118,13 +178,15 @@ class GPUIsolationManager:
                 "model_id": model_id
             }
             
-            # 初始化重启计数
+            # 初始化重启计数和任务跟踪
             self.restart_attempts[process_key] = 0
+            with self.task_lock:
+                self.active_tasks[process_key] = {}
             
-            logger.info(f"✅ GPU {gpu_id} 隔离进程已创建 (PID: {process.pid})")
+            logger.info(f"物理GPU {gpu_id} 隔离进程已创建 (PID: {process.pid})")
             return True
         except Exception as e:
-            logger.error(f"❌ 创建GPU {gpu_id} 隔离进程失败: {e}")
+            logger.error(f"创建物理GPU {gpu_id} 隔离进程失败: {e}")
             return False
     
     def restart_gpu_process(self, process_key: str) -> bool:
@@ -141,9 +203,12 @@ class GPUIsolationManager:
         config = self.process_configs[process_key]
         gpu_id = config["gpu_id"]
         
-        logger.warning(f"🔄 尝试重启GPU {gpu_id} 进程 (第 {self.restart_attempts[process_key] + 1} 次)")
+        logger.warning(f"尝试重启物理GPU {gpu_id} 进程 (第 {self.restart_attempts[process_key] + 1} 次)")
         
         try:
+            # 处理丢失的任务
+            self._handle_lost_tasks(process_key, gpu_id)
+            
             # 清理旧进程
             if process_key in self.processes:
                 old_process = self.processes[process_key]
@@ -175,12 +240,46 @@ class GPUIsolationManager:
             self.result_queues[process_key] = result_queue
             self.restart_attempts[process_key] += 1
             
-            logger.info(f"✅ GPU {gpu_id} 进程重启成功 (PID: {process.pid})")
+            # 重置任务跟踪
+            with self.task_lock:
+                self.active_tasks[process_key] = {}
+            
+            logger.info(f"物理GPU {gpu_id} 进程重启成功 (PID: {process.pid})")
             return True
             
         except Exception as e:
-            logger.error(f"❌ 重启GPU {gpu_id} 进程失败: {e}")
+            logger.error(f"重启物理GPU {gpu_id} 进程失败: {e}")
             return False
+    
+    def _handle_lost_tasks(self, process_key: str, gpu_id: str):
+        """处理进程重启时丢失的任务"""
+        with self.task_lock:
+            lost_tasks = self.active_tasks.get(process_key, {})
+            if lost_tasks:
+                logger.warning(f"进程 {process_key} 重启，处理 {len(lost_tasks)} 个丢失的任务")
+                
+                # 为每个丢失的任务生成错误结果
+                for task_id, task_data in lost_tasks.items():
+                    error_result = {
+                        "success": False,
+                        "error": f"GPU进程重启，任务丢失 (物理GPU: {gpu_id})",
+                        "task_id": task_id,
+                        "gpu_id": gpu_id,
+                        "model_id": task_data.get("model_id", "unknown")
+                    }
+                    
+                    # 尝试发送到结果队列（如果还存在）
+                    if process_key in self.result_queues:
+                        try:
+                            self.result_queues[process_key].put(error_result)
+                            logger.info(f"丢失任务 {task_id[:8]} 的错误结果已发送")
+                        except Exception as e:
+                            logger.error(f"发送丢失任务 {task_id[:8]} 错误结果失败: {e}")
+                    else:
+                        logger.warning(f"结果队列不存在，无法发送丢失任务 {task_id[:8]} 的错误结果")
+                
+                # 清空任务跟踪
+                self.active_tasks[process_key] = {}
     
     def check_and_restart_dead_processes(self) -> Dict[str, bool]:
         """检查并重启死亡的进程"""
@@ -196,9 +295,9 @@ class GPUIsolationManager:
                     restart_results[process_key] = success
                     
                     if success:
-                        logger.info(f"✅ 进程 {process_key} 重启成功")
+                        logger.info(f"进程 {process_key} 重启成功")
                     else:
-                        logger.error(f"❌ 进程 {process_key} 重启失败")
+                        logger.error(f"进程 {process_key} 重启失败")
                         
             except Exception as e:
                 logger.error(f"检查进程 {process_key} 状态时出错: {e}")
@@ -211,22 +310,22 @@ class GPUIsolationManager:
         process_key = f"{model_id}_{gpu_id}"
         
         if process_key not in self.task_queues:
-            logger.error(f"GPU {gpu_id} 进程不存在")
+            logger.error(f"物理GPU {gpu_id} 进程不存在")
             return False
         
         # 检查进程是否还活着
         if process_key not in self.processes:
-            logger.error(f"GPU {gpu_id} 进程记录不存在")
+            logger.error(f"物理GPU {gpu_id} 进程记录不存在")
             return False
             
         process = self.processes[process_key]
         if not process.is_alive():
-            logger.error(f"GPU {gpu_id} 进程已死亡 (PID: {process.pid}, exitcode: {process.exitcode})")
+            logger.error(f"物理GPU {gpu_id} 进程已死亡 (PID: {process.pid}, exitcode: {process.exitcode})")
             
             # 尝试重启进程
             restart_success = self.restart_gpu_process(process_key)
             if restart_success:
-                logger.info(f"GPU {gpu_id} 进程已重启，重新提交任务")
+                logger.info(f"物理GPU {gpu_id} 进程已重启，重新提交任务")
                 # 重新获取进程和队列
                 process = self.processes[process_key]
                 task_queue = self.task_queues[process_key]
@@ -236,31 +335,53 @@ class GPUIsolationManager:
             task_queue = self.task_queues[process_key]
         
         try:
-            # 异步提交任务，不等待结果
+            # 记录任务
             task_id = task.get('task_id', 'unknown')
-            logger.info(f"📤 异步提交任务到GPU {gpu_id} (PID: {process.pid}): {task_id[:8]}")
-            logger.info(f"📋 任务详情: 提示词='{task.get('prompt', '')[:50]}{'...' if len(task.get('prompt', '')) > 50 else ''}', 模式={task.get('mode', 'unknown')}")
+            with self.task_lock:
+                if process_key not in self.active_tasks:
+                    self.active_tasks[process_key] = {}
+                self.active_tasks[process_key][task_id] = task
+            
+            # 异步提交任务，不等待结果
+            logger.info(f"异步提交任务到物理GPU {gpu_id} (PID: {process.pid}): {task_id[:8]}")
+            logger.debug(f"任务详情: 提示词='{task.get('prompt', '')[:50]}{'...' if len(task.get('prompt', '')) > 50 else ''}', 模式={task.get('mode', 'unknown')}")
             
             task_queue.put(task, block=False)  # 非阻塞提交
-            logger.info(f"✅ 任务 {task_id[:8]} 已成功提交到GPU {gpu_id} 任务队列")
+            logger.info(f"任务 {task_id[:8]} 已成功提交到物理GPU {gpu_id} 任务队列")
             return True
             
         except queue.Full:
-            error_msg = f"GPU {gpu_id} 任务队列已满"
+            error_msg = f"物理GPU {gpu_id} 任务队列已满"
             logger.error(error_msg)
+            # 清理任务记录
+            with self.task_lock:
+                if process_key in self.active_tasks and task_id in self.active_tasks[process_key]:
+                    del self.active_tasks[process_key][task_id]
             return False
         except Exception as e:
-            error_msg = f"提交任务到GPU {gpu_id} 失败: {str(e)}"
+            error_msg = f"提交任务到物理GPU {gpu_id} 失败: {str(e)}"
             logger.error(error_msg)
             logger.error(f"错误详情: {traceback.format_exc()}")
+            # 清理任务记录
+            with self.task_lock:
+                if process_key in self.active_tasks and task_id in self.active_tasks[process_key]:
+                    del self.active_tasks[process_key][task_id]
             return False
+    
+    def mark_task_completed(self, gpu_id: str, model_id: str, task_id: str):
+        """标记任务完成，从跟踪中移除"""
+        process_key = f"{model_id}_{gpu_id}"
+        with self.task_lock:
+            if process_key in self.active_tasks and task_id in self.active_tasks[process_key]:
+                del self.active_tasks[process_key][task_id]
+                logger.debug(f"任务 {task_id[:8]} 已从跟踪中移除")
     
     def get_task_result(self, gpu_id: str, model_id: str, timeout: float = 300) -> Optional[Dict[str, Any]]:
         """从指定GPU获取任务结果 - 可选使用"""
         process_key = f"{model_id}_{gpu_id}"
         
         if process_key not in self.result_queues:
-            logger.error(f"GPU {gpu_id} 结果队列不存在")
+            logger.error(f"物理GPU {gpu_id} 结果队列不存在")
             return None
         
         result_queue = self.result_queues[process_key]
@@ -268,11 +389,16 @@ class GPUIsolationManager:
         try:
             # 等待结果
             result = result_queue.get(timeout=timeout)
-            logger.info(f"GPU {gpu_id} 获取到结果: {result.get('success', False)}")
+            logger.debug(f"物理GPU {gpu_id} 获取到结果: {result.get('success', False)}")
+            
+            # 标记任务完成
+            if 'task_id' in result:
+                self.mark_task_completed(gpu_id, model_id, result['task_id'])
+            
             return result
             
         except queue.Empty:
-            error_msg = f"GPU {gpu_id} 获取结果超时 ({timeout}秒)"
+            error_msg = f"物理GPU {gpu_id} 获取结果超时 ({timeout}秒)"
             logger.error(error_msg)
             return {
                 "success": False,
@@ -280,7 +406,7 @@ class GPUIsolationManager:
                 "gpu_id": gpu_id
             }
         except Exception as e:
-            error_msg = f"从GPU {gpu_id} 获取结果失败: {str(e)}"
+            error_msg = f"从物理GPU {gpu_id} 获取结果失败: {str(e)}"
             logger.error(error_msg)
             return {
                 "success": False,
@@ -295,6 +421,9 @@ class GPUIsolationManager:
         for process_key, process in self.processes.items():
             try:
                 is_alive = process.is_alive()
+                with self.task_lock:
+                    active_task_count = len(self.active_tasks.get(process_key, {}))
+                
                 status[process_key] = {
                     "pid": process.pid,
                     "alive": is_alive,
@@ -302,7 +431,8 @@ class GPUIsolationManager:
                     "name": process.name,
                     "daemon": process.daemon,
                     "restart_attempts": self.restart_attempts.get(process_key, 0),
-                    "max_restart_attempts": self.max_restart_attempts
+                    "max_restart_attempts": self.max_restart_attempts,
+                    "active_tasks": active_task_count
                 }
                 
                 # 如果进程死亡，记录详细信息
@@ -317,7 +447,8 @@ class GPUIsolationManager:
                     "exitcode": "unknown",
                     "error": str(e),
                     "restart_attempts": self.restart_attempts.get(process_key, 0),
-                    "max_restart_attempts": self.max_restart_attempts
+                    "max_restart_attempts": self.max_restart_attempts,
+                    "active_tasks": 0
                 }
         
         return status
@@ -325,6 +456,27 @@ class GPUIsolationManager:
     def shutdown(self):
         """关闭所有GPU进程"""
         logger.info("正在关闭GPU隔离管理器...")
+        
+        # 处理所有未完成的任务
+        for process_key in list(self.active_tasks.keys()):
+            with self.task_lock:
+                lost_tasks = self.active_tasks.get(process_key, {})
+                if lost_tasks:
+                    logger.warning(f"关闭时处理 {len(lost_tasks)} 个未完成任务")
+                    for task_id, task_data in lost_tasks.items():
+                        error_result = {
+                            "success": False,
+                            "error": "服务关闭，任务取消",
+                            "task_id": task_id,
+                            "gpu_id": "unknown",
+                            "model_id": task_data.get("model_id", "unknown")
+                        }
+                        # 尝试发送错误结果
+                        if process_key in self.result_queues:
+                            try:
+                                self.result_queues[process_key].put(error_result)
+                            except:
+                                pass
         
         # 发送退出信号
         for process_key, task_queue in self.task_queues.items():

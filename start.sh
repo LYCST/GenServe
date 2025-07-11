@@ -27,7 +27,7 @@ export DEFAULT_API_KEY="genserve-default-key-2024"
 # 支持最多10个API密钥
 export API_KEY_1="your-api-key-1:user1:generation,readonly"
 export API_KEY_2="your-api-key-2:user2:generation"
-export API_KEY_3="admin-key-2024:admin:all"
+export API_KEY_3="genserve-default-key-2024:admin:all"
 
 # 示例密钥配置（请根据实际需要修改）
 # export API_KEY_1="abc123def456:developer:generation,readonly"
@@ -77,16 +77,16 @@ export FLUX_REDUX_MODEL_PATH="/home/shuzuan/prj/models/FLUX.1-Redux-dev"
 # =============================================================================
 
 # 基础模型GPU分配 (使用GPU 0和1)
-export FLUX_GPUS="0,1,3,4"
+export FLUX_GPUS="1,2,3"
 
 # Depth模型GPU分配 (使用GPU 2，如果不配置则使用基础模型的GPU)
-export FLUX_DEPTH_GPUS="5,6"
+export FLUX_DEPTH_GPUS="4"
 
 # Fill模型GPU分配 (使用GPU 3，如果不配置则使用基础模型的GPU)
-export FLUX_FILL_GPUS="3,4"
+export FLUX_FILL_GPUS="5"
 
 # Redux模型GPU分配 (使用GPU 7，如果不配置则使用基础模型的GPU)
-export FLUX_REDUX_GPUS="7"
+export FLUX_REDUX_GPUS="6"
 
 # Canny模型GPU分配 (使用GPU 0和2，如果不配置则使用基础模型的GPU)
 # export FLUX_CANNY_GPUS="0,2"
